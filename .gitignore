@@ -1,0 +1,10 @@
+node_modules
+dist
+release
+probe/slots with spaces
+probe/FleetProbe/Saved
+probe/FleetProbe/Intermediate
+probe/FleetProbe/DerivedDataCache
+probe/capture-a.png
+probe/results.json
+test/screenshots
