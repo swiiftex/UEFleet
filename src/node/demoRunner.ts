@@ -59,6 +59,13 @@ export class DemoRunner {
     await this.useTool('Edit', { file_path: 'Source/Game/Garden/SprinklerComponent.cpp' }, 'Updated.', 'coding');
     this.emit({ k: 'progress', percent: 50 });
     if (kind === 'long') { await this.keepBusy(); return; }
+    if (kind === 'blocked') {
+      await this.useTool('mcp__fleet__check_packages', { paths: ['/Game/Garden/BP_Sprinkler'] }, 'Locked: Content/Garden/BP_Sprinkler.uasset');
+      await this.say("The sprinkler's timing is in a Blueprint someone else has locked, and nothing else can change it.");
+      this.emit({ k: 'blocked', locks: [{ path: 'Content/Garden/BP_Sprinkler.uasset', by: 'sam@example.com', branch: '/main/sam', destination: '/main', status: 'Retained', changeset: '812' }], why: 'The timing is only in this Blueprint.' });
+      this.emit({ k: 'turn-end' });
+      return;
+    }
 
     if (kind === 'ask') {
       const answer = await this.askMaster('What does ticket GARDEN-12 say about the sprinkler?');

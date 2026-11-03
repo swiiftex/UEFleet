@@ -28,7 +28,7 @@ export function parseStatus(output: string): Map<string, { code: string; isDir: 
 
 export interface ChangelistResult { name: string; assigned: string[]; failed: { path: string; reason: string }[] }
 
-const reason = (e: any) => String(e?.stderr || e?.stdout || e?.message || e).trim().split(/\r?\n/).pop() ?? 'cm failed';
+export const reason = (e: any) => String(e?.stderr || e?.stdout || e?.message || e).trim().split(/\r?\n/).pop() ?? 'cm failed';
 
 // A batch stops at its first problem, so going one at a time after a failure finds exactly which
 // files can't go through, such as one someone else has locked.

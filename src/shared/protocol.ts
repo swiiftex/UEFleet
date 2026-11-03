@@ -3,12 +3,12 @@
 
 export type AgentStatus =
   | 'queued' | 'provisioning' | 'working' | 'tools' | 'coding' | 'building' | 'testing'
-  | 'waiting-instance' | 'attention' | 'idle' | 'finished' | 'error' | 'stopped';
+  | 'waiting-instance' | 'attention' | 'blocked' | 'idle' | 'finished' | 'error' | 'stopped';
 
 export type ActivityBucket = 'thinking' | 'coding' | 'tools' | 'building' | 'testing' | 'waiting';
 export const BUCKETS: ActivityBucket[] = ['thinking', 'coding', 'tools', 'building', 'testing', 'waiting'];
 
-export type AttentionKind = 'permission' | 'question' | 'reply' | 'crash' | 'testing' | 'error' | 'all-done';
+export type AttentionKind = 'permission' | 'question' | 'reply' | 'crash' | 'testing' | 'error' | 'blocked' | 'all-done';
 
 export interface Attention {
   kind: AttentionKind;
@@ -40,6 +40,29 @@ export interface MergeState {
   files: number;
   conflicts?: { path: string; reason: string }[];
   error?: string;
+}
+
+// Someone else's hold on a package in source control.
+export interface PackageLock {
+  path: string;
+  by: string; // empty when source control wouldn't say who
+  branch: string; // where they hold it
+  destination: string; // the lock lasts until their work reaches here
+  status: 'Locked' | 'Retained'; // checked out right now, or checked in on their branch
+  changeset?: string; // their check-in, for a retained lock
+}
+export const lockHolder = (l: PackageLock) => l.by || 'someone else';
+export const describeLock = (l: PackageLock) => (l.status === 'Locked'
+  ? `Checked out by ${lockHolder(l)}${l.branch ? ` on ${l.branch}` : ''}.`
+  : `Checked in by ${lockHolder(l)} on ${l.branch}, and locked until that reaches ${l.destination}.`);
+
+export interface BlockedState {
+  locks: PackageLock[];
+  at: number;
+  why?: string; // what the agent needed them for
+  plan?: string; // what's being done about it
+  onMerge?: boolean; // the agent had finished, and this stopped its files moving on
+  canPause?: boolean; // only other agents being busy is in the way, and they can be paused
 }
 
 export interface FinalReport {
@@ -88,6 +111,7 @@ export type AgentEvent =
   | { k: 'usage-limit'; resetsAt?: number }
   | { k: 'credits-failed'; why: string }
   | { k: 'workspace-hold'; id: string; on: boolean; summary?: string }
+  | { k: 'blocked'; locks: PackageLock[]; why?: string }
   | { k: 'ask-master'; id: string; question: string }
   | { k: 'attention'; kind: AttentionKind; text: string; ref?: string }
   | { k: 'attention-clear'; ref?: string }
@@ -252,6 +276,7 @@ export interface AgentCard {
   isWorkspace?: boolean; // the chat that may change the workspace itself, pinned above the rest
   holdingWorkspace?: boolean;
   pausedForWorkspace?: boolean;
+  blocked?: BlockedState;
 }
 
 // Where the one-button test has got to.
@@ -305,6 +330,18 @@ export interface FleetSnapshot {
   demo: boolean;
   appUpdate?: AppUpdate | null;
   apiCredits?: ApiCreditsView;
+  masterMemory?: string[];
+  preferredMachine?: string | null;
+  planUsage?: UsageMeter[] | null;
+}
+
+// One of the subscription's limits, as the server reports it.
+export interface UsageMeter {
+  label: string;
+  main: boolean; // applies to everything, rather than one model
+  percentLeft: number;
+  resetsAt?: string;
+  severity: string;
 }
 
 // The key itself never reaches the screens.
@@ -352,7 +389,10 @@ export type HubEvent =
   | { e: 'all-done'; count: number }
   | { e: 'task-started'; id: string }
   | { e: 'app-update'; update: AppUpdate | null }
-  | { e: 'api-credits'; view: ApiCreditsView };
+  | { e: 'api-credits'; view: ApiCreditsView }
+  | { e: 'master-memory'; memory: string[] }
+  | { e: 'preferred-machine'; id: string | null }
+  | { e: 'plan-usage'; meters: UsageMeter[] | null };
 
 export const MODELS = [
   { id: 'claude-opus-5-5', label: 'Opus 5.5' },

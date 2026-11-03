@@ -5,12 +5,12 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import type { AgentEvent, AgentOptions, AgentSpawn, ApplyResult, ChangedFile, ImageAttachment, NodeEvent, NodeInfo, ProjectInfo } from '../shared/protocol';
+import type { AgentEvent, AgentOptions, AgentSpawn, ApplyResult, ChangedFile, ImageAttachment, NodeEvent, NodeInfo, PackageLock, ProjectInfo } from '../shared/protocol';
 import { AgentRunner } from './agentRunner';
 import { DemoRunner } from './demoRunner';
 import { appendPrompt, FLEET_TOOLS, fleetServer } from './fleetTools';
 import { personEditors, Slot, SlotManager, unrealProcesses } from './instance';
-import { checkedInVersion, readWorkspace, updateWorkspace, workspaceBranch, type PendingChange } from './sourceControl';
+import { bringInPackages, checkedInVersion, packageLocks, readWorkspace, updateWorkspace, workspaceBranch, type BringIn, type PendingChange } from './sourceControl';
 import { describeMachine, discoverProjects, projectMemoryDir, readProject, readProjectSettings, resolveEngine, statsSampler } from './machine';
 import { applyChanges, baseText, buildManifest, changedSince, listChanges, planReceive, readChunk, writeChunk, type ManifestEntry } from './projectSync';
 
@@ -153,7 +153,7 @@ export class NodeService extends EventEmitter {
     const server = fleetServer(live.slot, (report) => {
       emit({ k: 'final', report });
       void live.slot?.stopEditor();
-    }, (percent) => emit({ k: 'progress', percent }), (q) => this.askMaster(spawn.id, q), spawn.workspace ? (on, summary) => this.holdWorkspace(spawn.id, on, summary) : undefined);
+    }, (percent) => emit({ k: 'progress', percent }), (q) => this.askMaster(spawn.id, q), (locks, why) => emit({ k: 'blocked', locks, why }), spawn.workspace ? (on, summary) => this.holdWorkspace(spawn.id, on, summary) : undefined);
     const settings = project ? readProjectSettings(project.dir) : {};
     live.runner = new AgentRunner({
       spawn,
@@ -296,6 +296,13 @@ export class NodeService extends EventEmitter {
       return updateWorkspace(dir, { targetBranch, clear });
     });
   }
+  // Waits its turn with builds, and a person's editor stops it, because it could save its old assets
+  // over what arrives. Agents' editors are only stopped once the merge is sure to go ahead.
+  async bringInPackages(file: string, locks: PackageLock[]): Promise<BringIn> {
+    if (personEditors(await unrealProcesses(), file).length) return { outcome: 'refused', why: 'You have an editor open on this project. Close it so it can\'t save over what comes in.' };
+    const dir = path.dirname(file);
+    return this.slots.gate(dir).run(() => bringInPackages(dir, locks, () => Promise.all([...this.agents.values()].filter((a) => a.slot?.dir === dir).map((a) => a.slot!.stopEditor()))));
+  }
   // Once nothing's building in this project, and whether a person has an editor open on it.
   async projectQuiet(file: string) {
     await this.slots.gate(path.dirname(file)).idle();
@@ -382,6 +389,8 @@ export class NodeService extends EventEmitter {
       case 'machine.workspaceBranch': return workspaceBranch(path.dirname(p.file));
       case 'machine.workspaceState': return this.workspaceState(p.file, p.follow, p.delivered);
       case 'machine.updateWorkspace': return this.updateWorkspace(p.file, p.targetBranch, p.clear);
+      case 'machine.packageLocks': return packageLocks(path.dirname(p.file), p.paths);
+      case 'machine.bringInPackages': return this.bringInPackages(p.file, p.locks);
       case 'agent.stop': return this.stop(p.agentId, p.releaseSlot, p.slotDir);
       case 'agent.has': return this.has(p.agentId);
       case 'agent.changes': return this.changes(p, p.all);

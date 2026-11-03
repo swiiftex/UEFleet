@@ -11,8 +11,9 @@ import { NodeService } from '../node/nodeService';
 import { assignToChangelist, isPlasticWorkspace, realCm, type CmRun } from '../node/plastic';
 import { buildManifest, CHUNK, isBinaryPath, readChunk, writeChunk, mergeText } from '../node/projectSync';
 import { describeMachine, readProject } from '../node/machine';
-import type { PendingChange, WorkspaceState } from '../node/sourceControl';
-import { BUCKETS, DEFAULT_PERMISSION_MODE, MASTER_CHAT_ID, MASTER_PERMISSION_MODES, modelLabel, type ActivityBucket, type AgentCard, type AgentEvent, type AgentOptions, type AgentSpawn, type ApiCreditsView, type AgentStatus, type AppUpdate, type ApplyResult, type Broadcast, type ChangedFile, type FleetSnapshot, type FlowStage, type HubEvent, type ImageAttachment, type MachineView, type NewTask, type NewTaskDefaults, type NodeEvent, type NodeInfo, type ProjectInfo, type SlotInfo, type TranscriptItem } from '../shared/protocol';
+import { fetchPlanUsage } from '../node/planUsage';
+import { isPackage, type BringIn, type PendingChange, type WorkspaceState } from '../node/sourceControl';
+import { BUCKETS, DEFAULT_PERMISSION_MODE, describeLock, lockHolder, MASTER_CHAT_ID, MASTER_PERMISSION_MODES, modelLabel, type ActivityBucket, type AgentCard, type AgentEvent, type AgentOptions, type AgentSpawn, type ApiCreditsView, type AgentStatus, type AppUpdate, type ApplyResult, type Broadcast, type ChangedFile, type FleetSnapshot, type FlowStage, type HubEvent, type ImageAttachment, type MachineView, type NewTask, type NewTaskDefaults, type NodeEvent, type NodeInfo, type PackageLock, type ProjectInfo, type SlotInfo, type TranscriptItem, type UsageMeter } from '../shared/protocol';
 import { HostUpdates } from './hostUpdates';
 import { LinkServer, LOCAL_HOST_ID, type RemoteNode } from './link';
 import { chosenOptions, DemoMaster, MASTER_EFFORT, MASTER_MODEL, RealMaster, type MasterActions, type MasterBackend } from './masterChat';
@@ -55,6 +56,9 @@ interface AgentRec {
   advancing?: boolean;
   launching?: boolean; // on its way to its machine, so that machine won't have heard of it yet
   resumeOnReturn?: boolean; // its machine was told to restart under it, so it carries on afterwards
+  checkingLocks?: boolean;
+  mergeTried?: { at: number; failed: boolean }; // the last try at merging in what it's blocked on
+  ignoreLocks?: boolean; // the user chose to carry on past them
 }
 
 interface OpenQuestion { agentId: string; askId: string; label: string; question: string }
@@ -73,6 +77,16 @@ const SEND_IT = 'Send it';
 const CREDITS_RETRY_MS = 30 * 60_000;
 const WORKSPACE_FRESH_MS = 30 * 60_000; // how long a machine's workspace counts as recent before a new task
 const SYNC_WAIT_MS = 60_000;
+const MAX_MEMORY_NOTE = 2000;
+const USAGE_REFRESH_MS = 3 * 60_000;
+const BLOCKED_CHECK_MS = 30_000;
+const MERGE_RETRY_MS = 5 * 60_000;
+const USAGE_STALE_MS = 15 * 60_000;
+const DEMO_USAGE: UsageMeter[] = [
+  { label: 'Session', main: true, percentLeft: 62, resetsAt: new Date(Date.now() + 3 * 3_600_000).toISOString(), severity: 'normal' },
+  { label: 'Week', main: true, percentLeft: 12, resetsAt: new Date(Date.now() + 2 * 86_400_000).toISOString(), severity: 'warning' },
+  { label: 'Fable weekly', main: false, percentLeft: 100, severity: 'normal' },
+];
 
 type SyncResult = { outcome: 'updated' | 'current' | 'blocked' | 'failed'; message: string };
 const NO_MERGE_BASE = "there's no earlier version to merge from";
@@ -106,6 +120,10 @@ export class Hub extends EventEmitter {
   private apiCredits: { enabled: boolean; key: string | null; problem?: string; failedAt?: number } = { enabled: false, key: null };
   private workspaceHolds = new Map<string, string>(); // project file to the workspace chat holding it
   private holdWaiters: (() => void)[] = [];
+  private masterMemory: string[] = [];
+  private preferredMachine: string | null = null;
+  private planUsage: UsageMeter[] | null = null;
+  private planUsageAt = 0;
   private workspaceSyncs = new Map<string, Promise<SyncResult>>(); // updates running now, by machine and project
   private queuedSyncs = new Map<string, { nodeId: string; file: string; project: string }>(); // waiting for work there to finish
   private lastSynced: Record<string, number> = {};
@@ -133,10 +151,12 @@ export class Hub extends EventEmitter {
       changed: () => { this.machinesDirty = true; },
     });
     this.restore();
+    this.loadMasterMemory();
     this.ensureMasterCard();
     this.timers.push(setInterval(() => this.flush(), 120));
     this.timers.push(setInterval(() => this.sampleSpark(), 2000));
     this.timers.push(setInterval(() => { this.hostUpdates.checkAll(); this.watchLocalHost(); this.endCredits(); this.runQueuedSyncs(); }, 5000));
+    this.timers.push(setInterval(() => { for (const r of this.agents.values()) if (r.card.blocked && !r.card.archived) void this.checkLocks(r); }, BLOCKED_CHECK_MS));
   }
 
   private get localNode() { return this.link.nodes.get(LOCAL_HOST_ID); }
@@ -145,6 +165,8 @@ export class Hub extends EventEmitter {
   async start() {
     await this.link.start();
     this.machinesDirty = true;
+    void this.refreshUsage();
+    this.timers.push(setInterval(() => void this.refreshUsage(), USAGE_REFRESH_MS));
     if (this.opts.localHost) await this.startLocalHost();
     void this.hostUpdates.setExe(this.opts.hostAppPath);
     if (this.local) this.resumeFlows(LOCAL_HOST_ID);
@@ -353,7 +375,7 @@ export class Hub extends EventEmitter {
       case 'activity': {
         if (c.runningSince === null && ev.status !== 'attention') c.runningSince = Date.now();
         if (c.attention && ev.status !== 'attention') { /* attention stays until cleared explicitly */ }
-        c.status = c.attention && ev.status !== 'attention' ? 'attention' : ev.status;
+        c.status = c.blocked ? 'blocked' : c.attention && ev.status !== 'attention' ? 'attention' : ev.status;
         c.detail = ev.detail;
         if (ev.bucket !== undefined) this.setBucket(r, ev.bucket);
         this.stageFromActivity(r, ev.status);
@@ -377,6 +399,9 @@ export class Hub extends EventEmitter {
           .catch((e) => String(e?.message ?? e))
           .then((answer) => this.nodeCall(c.nodeId, 'agent.masterReply', { agentId: c.id, id: ev.id, answer }))
           .catch(() => {});
+        break;
+      case 'blocked':
+        this.setBlocked(r, ev.locks, ev.why);
         break;
       case 'usage':
         c.usage = { ...c.usage, ...ev.usage };
@@ -416,6 +441,7 @@ export class Hub extends EventEmitter {
         break;
       case 'ended':
         if (LIVE.has(c.status)) { c.status = 'idle'; this.setBucket(r, null); this.stopClock(r); }
+        if (c.blocked) this.stopClock(r);
         break;
     }
     this.dirtyCards.add(c.id);
@@ -439,6 +465,7 @@ export class Hub extends EventEmitter {
 
   private onFinal(r: AgentRec, report: AgentCard['final'] & {}) {
     const c = r.card;
+    c.blocked = undefined;
     c.final = report;
     c.testRun = undefined;
     this.clearTests(c.id);
@@ -482,6 +509,17 @@ export class Hub extends EventEmitter {
       c.status = c.attention ? 'attention' : 'idle';
       return;
     }
+    if (c.blocked) {
+      // Stopping it or a failure ends the wait, unless what's blocked is its finished work moving on.
+      if (c.blocked.onMerge || !(ev.interrupted || ev.isError)) {
+        c.status = 'blocked';
+        c.attention ??= this.blockedAttention(c.blocked.locks);
+        this.checkAllDone();
+        void this.checkLocks(r);
+        return;
+      }
+      c.blocked = undefined;
+    }
     if (c.final) { c.status = 'finished'; if (c.attention?.kind !== 'testing' && !c.merge?.conflicts?.length) c.attention = null; return; }
     if (ev.interrupted) {
       // The user just did this, so there's nothing to tell them.
@@ -521,7 +559,7 @@ export class Hub extends EventEmitter {
   private checkAllDone() {
     if (this.workspaceHolds.size) return;
     const cards = [...this.agents.values()].map((r) => r.card).filter((c) => !c.archived && !c.isMaster && !c.isWorkspace);
-    const busy = cards.some((c) => LIVE.has(c.status) || (c.status === 'attention' && c.attention?.kind !== 'testing'));
+    const busy = cards.some((c) => LIVE.has(c.status) || c.status === 'blocked' || (c.status === 'attention' && c.attention?.kind !== 'testing'));
     if (!busy && this.wasBusy && cards.length) {
       this.emitEvent({ e: 'all-done', count: this.testList().filter((t) => !t.done).length });
     }
@@ -621,7 +659,67 @@ export class Hub extends EventEmitter {
       demo: this.opts.demo,
       appUpdate: this.appUpdate,
       apiCredits: this.creditsView(),
+      masterMemory: this.masterMemory,
+      preferredMachine: this.preferredMachine,
+      planUsage: this.planUsage,
     };
+  }
+
+  // ---- Where work goes, and how much is left ----
+
+  setPreferredMachine(id: string | null) {
+    if (id && !this.machines().some((m) => m.info.id === id)) throw new Error("That machine isn't linked.");
+    this.preferredMachine = id;
+    this.emitEvent({ e: 'preferred-machine', id });
+    this.scheduleSave();
+  }
+
+  // A demo has no account to ask about. If it can't be read for a while, showing nothing beats old numbers.
+  private async refreshUsage() {
+    const meters = this.opts.demo ? DEMO_USAGE : await fetchPlanUsage(this.localInfo.claudePath).catch(() => null);
+    if (meters) this.planUsageAt = Date.now();
+    else if (Date.now() - this.planUsageAt < USAGE_STALE_MS) return;
+    this.planUsage = meters;
+    this.emitEvent({ e: 'plan-usage', meters });
+  }
+
+  // ---- The master chat's memory ----
+  // Standing instructions from the user, kept as a plain list they could read for themselves. Each
+  // change shows in the chat, so nothing can quietly reshape what the master does.
+
+  private get memoryFile() { return path.join(this.opts.dataDir, 'master-memory.md'); }
+
+  private loadMasterMemory() {
+    try {
+      this.masterMemory = fs.readFileSync(this.memoryFile, 'utf8').split(/\r?\n/).filter((l) => l.startsWith('- ')).map((l) => l.slice(2));
+    } catch { /* nothing saved yet */ }
+  }
+
+  private memoryChanged() {
+    fs.mkdirSync(this.opts.dataDir, { recursive: true });
+    fs.writeFileSync(this.memoryFile, this.masterMemory.map((m) => `- ${m}\n`).join(''));
+    this.emitEvent({ e: 'master-memory', memory: this.masterMemory });
+    this.masterBackend?.memoryChanged(this.masterMemory);
+  }
+
+  addMasterMemory(text: string) {
+    const note = text.replace(/\s+/g, ' ').trim();
+    if (!note) throw new Error('There was nothing to remember.');
+    if (note.length > MAX_MEMORY_NOTE) throw new Error(`That's too long for one note. Keep it under ${MAX_MEMORY_NOTE} characters, or split it up.`);
+    if (this.masterMemory.includes(note)) return `Already remembered: ${note}`;
+    this.masterMemory = [...this.masterMemory, note];
+    this.memoryChanged();
+    this.note(this.masterRec, `Remembered: ${note}`, undefined, true);
+    return `Remembered: ${note}`;
+  }
+
+  removeMasterMemory(index: number) {
+    const note = this.masterMemory[index];
+    if (note === undefined) throw new Error(`There's no note ${index + 1}.`);
+    this.masterMemory = this.masterMemory.filter((_, i) => i !== index);
+    this.memoryChanged();
+    this.note(this.masterRec, `Forgot: ${note}`, undefined, true);
+    return `Forgot: ${note}`;
   }
 
   // ---- API credits ----
@@ -845,7 +943,7 @@ export class Hub extends EventEmitter {
       const c = o.card;
       if (LIVE.has(c.status) || c.attention?.ref) {
         c.pausedForWorkspace = true;
-        this.note(o, 'Paused while the workspace chat changes the workspace.', 'warn', true);
+        this.note(o, `Paused while ${r.card.isWorkspace ? 'the workspace chat' : 'UE Fleet'} changes the workspace.`, 'warn', true);
         await this.interrupt(c.id).catch(() => {});
       }
       await this.stopInstance(c.id).catch(() => {});
@@ -876,7 +974,7 @@ export class Hub extends EventEmitter {
         carrying++;
       } else if (o.card.pausedForWorkspace) {
         o.card.pausedForWorkspace = false;
-        void this.send(o.card.id, `The workspace chat has finished changing the workspace${changed}. Files may have changed under you, and your editor was stopped. Re-read anything you were relying on, rebuild if code changed, and carry on.`, undefined, undefined, 'UE Fleet').catch(() => {});
+        void this.send(o.card.id, `${r.card.isWorkspace ? 'The workspace chat' : 'UE Fleet'} has finished changing the workspace${changed}. Files may have changed under you, and your editor was stopped. Re-read anything you were relying on, rebuild if code changed, and carry on.`, undefined, undefined, 'UE Fleet').catch(() => {});
         carrying++;
       }
     }
@@ -888,6 +986,145 @@ export class Hub extends EventEmitter {
   private async workspaceFree(r: AgentRec) {
     const file = this.masterProjectFile(r) ?? r.spawn.project?.file;
     while (this.holdOn(file)) await new Promise<void>((wake) => this.holdWaiters.push(wake));
+  }
+
+  // ---- Blocked on a locked package ----
+
+  private blockedAttention(locks: PackageLock[]) {
+    const holders = [...new Set(locks.map(lockHolder))].join(' and ');
+    const text = locks.length === 1 ? `${path.posix.basename(locks[0].path)} is locked by ${holders}.` : `${locks.length} packages are locked by ${holders}.`;
+    return { kind: 'blocked' as const, text, at: Date.now() };
+  }
+
+  private setBlocked(r: AgentRec, locks: PackageLock[], why?: string, onMerge?: boolean) {
+    const c = r.card;
+    c.blocked = { locks, why, onMerge, at: Date.now() };
+    c.status = 'blocked';
+    c.attention = this.blockedAttention(locks);
+    r.mergeTried = undefined;
+    this.note(r, `Blocked:\n${locks.map((l) => `${l.path}: ${describeLock(l)}`).join('\n')}`, 'warn', true);
+    this.dirtyCards.add(c.id);
+    this.scheduleSave();
+    this.emit('attention', c);
+    this.checkAllDone();
+    void this.checkLocks(r);
+  }
+
+  // Work that has finished is on its way to the user's own workspace, so that's the one that counts.
+  private lockTarget(r: AgentRec) {
+    const own = r.spawn.project ? { nodeId: r.card.nodeId, file: r.spawn.project.file } : null;
+    const master = this.masterProjectFile(r);
+    return r.card.blocked?.onMerge && master ? { nodeId: LOCAL_HOST_ID, file: master } : own;
+  }
+
+  // Is the lock gone, and if not, can the holder's check-in be merged in yet? Only retained locks have
+  // one to merge, and this waits for other agents here so nothing changes under them mid-task.
+  private async checkLocks(r: AgentRec, opts: { pressed?: boolean; othersPaused?: boolean } = {}) {
+    const c = r.card;
+    // The first look waits for the agent's turn to end, so what it's told next doesn't land mid-turn.
+    if (!c.blocked || r.checkingLocks || (!opts.pressed && !c.blocked.onMerge && c.runningSince !== null)) return;
+    r.checkingLocks = true;
+    const plan = (text: string, canPause = false) => { if (c.blocked) { c.blocked.plan = text; c.blocked.canPause = canPause; } };
+    try {
+      const target = this.lockTarget(r);
+      // A demo has no source control, so its lock goes when you press the button.
+      const locks = r.spawn.demo ? (opts.pressed ? [] : c.blocked.locks)
+        : target ? await this.nodeCall<PackageLock[]>(target.nodeId, 'machine.packageLocks', { file: target.file, paths: c.blocked.locks.map((l) => l.path) }) : [];
+      if (!c.blocked) return;
+      if (!locks.length) {
+        this.unblock(r, `${c.blocked.locks.map((l) => l.path).join(', ')} ${c.blocked.locks.length === 1 ? "isn't" : "aren't"} locked any more.`);
+        return;
+      }
+      const holders = [...new Set(locks.map(lockHolder))].join(' and ');
+      c.blocked.locks = locks;
+      if (c.attention?.kind === 'blocked') c.attention = { ...c.attention, text: this.blockedAttention(locks).text };
+      if (r.spawn.demo || !target) { plan(`Waiting for ${holders}.`); return; }
+      if (locks.some((l) => l.status === 'Locked')) {
+        plan(`Waiting for ${holders} to check it in. It merges in by itself after that, if it can.`);
+        return;
+      }
+      const busy = [...this.agents.values()].filter((o) => o !== r && !o.card.archived && LIVE.has(o.card.status) && o.card.nodeId === target.nodeId && normalPath(o.spawn.project?.file ?? '') === normalPath(target.file)).length;
+      if (!opts.othersPaused && (busy || this.holdOn(target.file))) {
+        plan(`${holders}'s check-in merges in once ${busy === 1 ? 'the other agent here stops' : busy ? `the ${busy} other agents here stop` : 'the workspace is free'}, so nothing changes mid-task.`, !!busy && r.card.nodeId === target.nodeId);
+        return;
+      }
+      const tried = r.mergeTried;
+      if (!opts.pressed && tried && (tried.failed || Date.now() - tried.at < MERGE_RETRY_MS)) return;
+      r.mergeTried = { at: Date.now(), failed: false };
+      plan(`Merging in ${holders}'s check-in…`);
+      this.dirtyCards.add(c.id);
+      const res = await this.nodeCall<BringIn>(target.nodeId, 'machine.bringInPackages', { file: target.file, locks });
+      if (!c.blocked) return;
+      const free = `It's free once ${holders} merges ${[...new Set(locks.map((l) => l.branch))].join(' and ')} into ${[...new Set(locks.map((l) => l.destination))].join(' and ')}.`;
+      if (res.outcome === 'already') this.unblock(r, 'This workspace already has that check-in, so it can go ahead.');
+      else if (res.outcome === 'refused') plan(`Can't merge it in by itself. ${res.why} ${free}`);
+      else if (res.outcome === 'failed') {
+        r.mergeTried.failed = true;
+        plan(`The merge stopped: ${res.why.replace(/\.?$/, '.')} Part of it may be in your workspace, so look at it in Plastic before trying again.`);
+        this.note(r, `Merging in ${holders}'s check-in stopped: ${res.why}`, 'error');
+      } else {
+        const list = res.changesets.join(', ');
+        this.note(r, `Merged in ${holders}'s check-in (changeset ${list}), ${res.files.length} file${res.files.length === 1 ? '' : 's'}. Nothing was checked in. Plastic lists it as "Cherrypicking from cs:${res.changesets[0]}", and won't check in anything else until those files go in, on their own or along with it.`, 'warn', true);
+        this.unblock(r, `UE Fleet merged ${holders}'s check-in (changeset ${list}) into this workspace, so you have their version of ${locks.map((l) => l.path).join(', ')}, and ${res.files.length} file${res.files.length === 1 ? '' : 's'} changed with it. Re-read anything you were relying on, and rebuild if code changed.`);
+      }
+    } catch (e: any) {
+      plan(`Couldn't check: ${String(e?.message ?? e).slice(0, 180)}`);
+    } finally {
+      r.checkingLocks = false;
+      this.dirtyCards.add(c.id);
+      this.scheduleSave();
+    }
+  }
+
+  private unblock(r: AgentRec, what: string) {
+    const c = r.card;
+    const onMerge = c.blocked?.onMerge;
+    c.blocked = undefined;
+    if (c.attention?.kind === 'blocked') c.attention = null;
+    c.status = c.final ? 'finished' : 'idle';
+    this.dirtyCards.add(c.id);
+    if (onMerge) {
+      this.note(r, what, undefined, true);
+      void this.advance(r);
+    } else void this.send(c.id, `${what} Carry on with your task.`, undefined, undefined, 'UE Fleet').catch((e) => this.note(r, `Couldn't tell the agent to carry on: ${e?.message ?? e}`, 'error'));
+    this.checkAllDone();
+  }
+
+  checkBlocked(agentId: string) { return this.checkLocks(this.need(agentId), { pressed: true }); }
+
+  // Pausing the other agents is the user's call, so it only happens from the button.
+  async mergeBlockedNow(agentId: string) {
+    const r = this.need(agentId);
+    if (!r.card.blocked) return;
+    await this.holdWorkspace(r);
+    try {
+      await this.checkLocks(r, { pressed: true, othersPaused: true });
+    } finally {
+      await this.releaseWorkspace(agentId, r.card.blocked ? undefined : "someone's check-in of a locked package was merged in");
+    }
+  }
+
+  async carryOnPastBlock(agentId: string) {
+    const r = this.need(agentId);
+    const c = r.card;
+    if (!c.blocked) return;
+    const names = c.blocked.locks.map((l) => l.path).join(', ');
+    r.ignoreLocks = true;
+    this.note(r, `Carrying on past the lock on ${names}. It may stop the check-in until that lock is released.`, 'warn', true);
+    if (c.blocked.onMerge) this.unblock(r, 'Moving on to the merge.');
+    else this.unblock(r, `The user says not to wait for the lock on ${names}. Go ahead and change them if the task needs it, and say in your final message that they're locked.`);
+  }
+
+  // Once these are merged they have to be checked in, and a lock someone else holds would stop that.
+  private async lockedAtMerge(r: AgentRec) {
+    const file = this.masterProjectFile(r);
+    if (!file || r.ignoreLocks) return false;
+    const changed = await this.changes(r.card.id).catch(() => [] as ChangedFile[]);
+    const paths = changed.filter((f) => !f.usuallySkipped && !r.keepMine?.includes(f.path) && isPackage(f.path)).map((f) => f.path);
+    if (!paths.length) return false;
+    const locks = await this.nodeCall<PackageLock[]>(LOCAL_HOST_ID, 'machine.packageLocks', { file, paths }).catch(() => [] as PackageLock[]);
+    if (locks.length) this.setBlocked(r, locks, undefined, true);
+    return locks.length > 0;
   }
 
   private safePairing() { try { return this.link.pairing(); } catch { return null; } }
@@ -926,7 +1163,7 @@ export class Hub extends EventEmitter {
     // this folder from then on, because a conversation can only resume from where it started.
     r.slotDir ??= main?.dir ?? path.join(this.opts.dataDir, 'master');
     this.masterBackend = new RealMaster({
-      spawn: { ...r.spawn, resumeSessionId: r.card.sessionId }, cwd: r.slotDir, claudePath: info.claudePath, machineName: info.name,
+      spawn: { ...r.spawn, resumeSessionId: r.card.sessionId }, cwd: r.slotDir, claudePath: info.claudePath, machineName: info.name, memory: this.masterMemory,
       actions: this.masterActions(), otherDirs: projects.map((p) => p.dir).filter((d) => d !== r.slotDir), emit,
     });
     return this.masterBackend;
@@ -978,6 +1215,9 @@ export class Hub extends EventEmitter {
         void this.setMasterPermissions(a.mode);
         return `This chat now uses ${a.mode} permissions.`;
       },
+      remember: async (a) => this.addMasterMemory(a.text),
+      forget: async (a) => this.removeMasterMemory(a.number - 1),
+      listMemory: async () => (this.masterMemory.length ? this.masterMemory.map((m, i) => `${i + 1}. ${m}`).join('\n') : 'Nothing saved yet.'),
       workspaceStatus: async (a) => {
         const { m, project } = workspaceOn(a);
         const outlook = await this.workspaceOutlook(m.info.id, project.file, project.name);
@@ -1008,8 +1248,8 @@ export class Hub extends EventEmitter {
         void work.then((res) => this.reportSync(res));
         return `${m.info.name} is still updating, which can take a while. The result will appear in this chat.`;
       },
-      machines: () => this.machines().map((m) => ({ name: m.info.name, online: m.online, cpuPercent: m.stats?.cpu, freeRamGb: m.stats ? m.info.ramGb - m.stats.ramUsedGb : undefined, agents: this.liveOn(m.info.id), maxEditors: m.info.maxInstances, projects: m.info.projects.map((p) => p.name), update: m.update?.stage })),
-      agents: () => [...this.agents.values()].map((r) => r.card).filter((c) => !c.archived && !c.isMaster).map((c) => ({ number: c.index, title: c.title, stage: c.stage, status: c.status, machine: nameOf(c.nodeId), project: c.project, model: c.model, effort: c.effort, permissions: c.permissionMode, onApiCredits: c.onApiCredits, workspaceChat: c.isWorkspace, pausedForWorkspace: c.pausedForWorkspace, progress: c.progress, needsUser: c.attention?.text, said: c.lastText.slice(0, 300) })),
+      machines: () => this.machines().map((m) => ({ name: m.info.name, online: m.online, cpuPercent: m.stats?.cpu, freeRamGb: m.stats ? m.info.ramGb - m.stats.ramUsedGb : undefined, agents: this.liveOn(m.info.id), maxEditors: m.info.maxInstances, projects: m.info.projects.map((p) => p.name), update: m.update?.stage, preferred: m.info.id === this.preferredMachine })),
+      agents: () => [...this.agents.values()].map((r) => r.card).filter((c) => !c.archived && !c.isMaster).map((c) => ({ number: c.index, title: c.title, stage: c.stage, status: c.status, machine: nameOf(c.nodeId), project: c.project, model: c.model, effort: c.effort, permissions: c.permissionMode, onApiCredits: c.onApiCredits, workspaceChat: c.isWorkspace, pausedForWorkspace: c.pausedForWorkspace, progress: c.progress, needsUser: c.attention?.text, blockedOn: c.blocked && { locks: c.blocked.locks, plan: c.blocked.plan }, said: c.lastText.slice(0, 300) })),
       startTask: async (a) => {
         const opts = this.masterOptions ?? { ...this.defaults, nodeId: 'auto', prompt: '' };
         const known = this.localInfo.projects;
@@ -1048,7 +1288,7 @@ export class Hub extends EventEmitter {
         const { card: c } = byNumber(a.agent);
         const files = await this.changes(c.id).catch(() => [] as ChangedFile[]);
         const recent = this.transcript(c.id).filter((t) => t.kind === 'user' || t.kind === 'assistant').slice(-8).map((t) => ({ from: t.kind, text: (t as { text: string }).text.slice(0, 1000) }));
-        return JSON.stringify({ number: c.index, title: c.title, stage: c.stage, status: c.status, machine: nameOf(c.nodeId), project: c.project, model: c.model, effort: c.effort, permissions: c.permissionMode, progress: c.progress, needsUser: c.attention?.text, finalReport: c.final, merge: c.merge, changelist: c.changelist, filesChanged: files.map((f) => f.path), recent }, null, 2);
+        return JSON.stringify({ number: c.index, title: c.title, stage: c.stage, status: c.status, machine: nameOf(c.nodeId), project: c.project, model: c.model, effort: c.effort, permissions: c.permissionMode, progress: c.progress, needsUser: c.attention?.text, blockedOn: c.blocked && { locks: c.blocked.locks, plan: c.blocked.plan }, finalReport: c.final, merge: c.merge, changelist: c.changelist, filesChanged: files.map((f) => f.path), recent }, null, 2);
       },
       setAgentOptions: async (a) => {
         const options = chosenOptions(a);
@@ -1229,6 +1469,7 @@ export class Hub extends EventEmitter {
     try {
       const c = r.card;
       if (c.stage === 'awaiting-merge') {
+        if (c.blocked || (c.project && await this.lockedAtMerge(r))) return;
         if (c.project && !(await this.merge(r, force))) return;
         c.stage = c.project ? 'merged' : 'complete';
         this.dirtyCards.add(c.id);
@@ -1313,7 +1554,7 @@ export class Hub extends EventEmitter {
   async approve(agentId: string) {
     const r = this.need(agentId);
     const c = r.card;
-    if (!c.final) return;
+    if (!c.final || c.blocked) return;
     c.final.needsTesting.forEach((_, i) => this.doneTests.add(`${agentId}:${i}`));
     c.attention = null;
     if (c.status === 'attention') c.status = 'finished';
@@ -1344,7 +1585,7 @@ export class Hub extends EventEmitter {
   async createAgent(task: NewTask, givenTitle?: string): Promise<string> {
     const id = crypto.randomBytes(5).toString('hex');
     const project = task.projectFile ? readProject(task.projectFile, this.localInfo.engines) : null;
-    const placed = task.nodeId === 'auto' ? placeTask(this.machines(), this.liveOn, project) : { nodeId: task.nodeId, reason: '' };
+    const placed = task.nodeId === 'auto' ? placeTask(this.machines(), this.liveOn, project, this.preferredMachine) : { nodeId: task.nodeId, reason: '' };
     const nodeId = placed.nodeId;
     const title = givenTitle ?? titleFrom(task.prompt);
     const card: AgentCard = {
@@ -1476,6 +1717,8 @@ export class Hub extends EventEmitter {
     const r = this.need(agentId);
     if (!r.card.isMaster) this.wasBusy = true;
     r.answeringBroadcast = !!broadcastId;
+    // Whatever it was waiting for, it's back at work and can report it again if it has to.
+    if (r.card.blocked) { r.card.blocked = undefined; r.card.status = 'working'; }
     if (r.card.final || (r.card.stage && AFTER_AGENT.has(r.card.stage))) {
       // More to do, so back to the agent. What's already merged stays, and goes around again with it.
       r.card.final = null;
@@ -1486,6 +1729,7 @@ export class Hub extends EventEmitter {
       r.card.merge = undefined;
       r.card.changelist = undefined;
       r.askedForChangelist = false;
+      r.ignoreLocks = false;
       this.emitTests();
     }
     r.card.attention = null;
@@ -1581,6 +1825,7 @@ export class Hub extends EventEmitter {
     this.stopClock(r);
     r.card.status = r.card.isMaster ? 'idle' : 'stopped';
     r.card.attention = null;
+    r.card.blocked = undefined;
     r.card.tps = 0;
     this.dirtyCards.add(agentId);
     this.scheduleSave();
@@ -1596,6 +1841,7 @@ export class Hub extends EventEmitter {
     await fsp.rm(this.mergedDir(agentId), { recursive: true, force: true }).catch(() => {});
     r.card.archived = true;
     r.card.attention = null;
+    r.card.blocked = undefined;
     this.dirtyCards.add(agentId);
     this.emitTests();
     this.scheduleSave();
@@ -1608,7 +1854,7 @@ export class Hub extends EventEmitter {
     // A pending prompt still has to be answered; only "nothing is blocked" attention can be dropped.
     if (r.card.attention.ref) return;
     // Looking at these doesn't settle them. The card keeps saying it needs you until you've decided.
-    if (r.card.attention.kind === 'testing' || r.card.merge?.conflicts?.length) return;
+    if (r.card.attention.kind === 'testing' || r.card.attention.kind === 'blocked' || r.card.merge?.conflicts?.length) return;
     r.card.attention = null;
     if (r.card.status === 'attention') r.card.status = r.card.final ? 'finished' : 'idle';
     this.dirtyCards.add(agentId);
@@ -1631,7 +1877,11 @@ export class Hub extends EventEmitter {
     this.machinesDirty = true;
   }
   rotatePairing() { this.link.rotatePairing(); return this.safePairing(); }
-  forgetMachine(hostId: string) { this.link.forget(hostId); this.machinesDirty = true; }
+  forgetMachine(hostId: string) {
+    this.link.forget(hostId);
+    this.machinesDirty = true;
+    if (this.preferredMachine === hostId) this.setPreferredMachine(null);
+  }
 
   // Enough for a machine to find this card's folder even with no agent running there.
   private whereOf(r: AgentRec) {
@@ -1770,7 +2020,7 @@ export class Hub extends EventEmitter {
     const agents = [...this.agents.values()].map((r) => ({ card: r.card, spawn: { ...r.spawn, images: undefined }, slotDir: r.slotDir, lastSeq: r.lastSeq, sourceProjectDir: r.sourceProjectDir, notStarted: r.notStarted, pulled: r.pulled, keepMine: r.keepMine, resumeOnReturn: r.resumeOnReturn, heldNew: r.heldNew }));
     fs.mkdirSync(this.opts.dataDir, { recursive: true });
     const tmp = `${this.stateFile()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ agents, nextIndex: this.nextIndex, defaults: this.defaults, doneTests: [...this.doneTests], broadcasts: this.broadcasts, openQuestions: [...this.openQuestions], unrouted: this.unrouted.map((t) => ({ ...t, images: undefined })), creditsEnabled: this.apiCredits.enabled, workspaceHolds: [...this.workspaceHolds], queuedSyncs: [...this.queuedSyncs], lastSynced: this.lastSynced, delivered: this.delivered }));
+    fs.writeFileSync(tmp, JSON.stringify({ agents, nextIndex: this.nextIndex, defaults: this.defaults, doneTests: [...this.doneTests], broadcasts: this.broadcasts, openQuestions: [...this.openQuestions], unrouted: this.unrouted.map((t) => ({ ...t, images: undefined })), creditsEnabled: this.apiCredits.enabled, workspaceHolds: [...this.workspaceHolds], queuedSyncs: [...this.queuedSyncs], lastSynced: this.lastSynced, delivered: this.delivered, preferredMachine: this.preferredMachine }));
     fs.renameSync(tmp, this.stateFile());
   }
 
@@ -1788,6 +2038,7 @@ export class Hub extends EventEmitter {
     this.queuedSyncs = new Map(saved.queuedSyncs ?? []);
     this.lastSynced = saved.lastSynced ?? {};
     this.delivered = saved.delivered ?? {};
+    this.preferredMachine = saved.preferredMachine ?? null;
     for (const a of saved.agents ?? []) {
       const card: AgentCard = a.card;
       if (card.archived) continue;

@@ -86,6 +86,9 @@ export function handleEvent(e: HubEvent) {
     case 'transcript': applyTranscript(e); break;
     case 'all-done': if (e.count > 0) setState({ allDone: { count: e.count, at: Date.now() } }); break;
     case 'api-credits': setState({ snapshot: { ...s, apiCredits: e.view } }); break;
+    case 'master-memory': setState({ snapshot: { ...s, masterMemory: e.memory } }); break;
+    case 'preferred-machine': setState({ snapshot: { ...s, preferredMachine: e.id } }); break;
+    case 'plan-usage': setState({ snapshot: { ...s, planUsage: e.meters } }); break;
     // Someone watching the master chat follows the request to the agent it started.
     case 'task-started': if (state.selectedId === MASTER_CHAT_ID) void select(e.id); break;
     case 'app-update':

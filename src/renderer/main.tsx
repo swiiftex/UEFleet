@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { BUCKETS, MASTER_CHAT_ID, type ActivityBucket, type MachineView } from '../shared/protocol';
+import { BUCKETS, MASTER_CHAT_ID, type ActivityBucket, type MachineView, type UsageMeter } from '../shared/protocol';
 import { CardGrid, isLive, MasterBar, SLOT_LABEL } from './Cards';
 import { DetailPanel } from './Detail';
 import { AttentionPopup, BroadcastOverlay, handlePopupKey, MachinesModal, NewTaskModal } from './Overlays';
@@ -42,6 +42,7 @@ function TopBar() {
       {appUpdate && <button className="btn small attn" onClick={() => void window.fleet.applyUpdate()} title="Agents and editors keep running through this." data-app-update>{appUpdate.needsRestart ? 'New version: restart' : 'New version: reload'}</button>}
       <span className="spacer" />
       <div className="filter"><span>/</span><input placeholder="filter" value={filter} onChange={(e) => setState({ filter: e.target.value })} data-filter /></div>
+      <UsageLeft />
       <span className="metric"><label>tokens used</label><b>{fmtTokens(tokens)}</b></span>
       <span className="metric"><b>{fmtTokens(tps)}/s</b><label>now</label></span>
       <span className="ring" style={{ background: `conic-gradient(${ring})` }} aria-hidden="true" />
@@ -53,6 +54,19 @@ function TopBar() {
       <button className={`btn small${openTests ? ' attn' : ''}`} disabled={!openTests} onClick={goToNextTest} title="Go to the next checklist" data-tests-btn>to test{openTests ? ` ${openTests}` : ''}</button>
       <button className="btn small" onClick={() => setState({ modal: 'machines' })}>machines</button>
     </header>
+  );
+}
+
+// The server says how worried to be about each, so the colour is its call rather than ours.
+function UsageLeft() {
+  const meters = useStore((s) => s.snapshot.planUsage);
+  if (!meters?.length) return null;
+  const line = (m: UsageMeter) => `${m.label}: ${m.percentLeft}% left${m.resetsAt ? `, resets ${new Date(m.resetsAt).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' })}` : ''}`;
+  return (
+    <span className="metric usage-left" data-usage-left title={meters.map(line).join('\n')}>
+      <label>usage left</label>
+      {meters.filter((m) => m.main).map((m) => <b key={m.label} className={`usage-${m.severity}`}>{m.label.toLowerCase()} {m.percentLeft}%</b>)}
+    </span>
   );
 }
 

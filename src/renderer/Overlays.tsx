@@ -4,7 +4,7 @@ import { isLive } from './Cards';
 import { attentionQueue, dismissPopup, fmtAgo, getState, goToNextTest, pad2, select, setState, useStore } from './store';
 
 const KIND_LABEL: Record<string, string> = {
-  permission: 'Needs permission', question: 'Has a question', reply: 'Waiting on you', crash: 'Unreal crashed', testing: 'Ready to test', error: 'Hit an error',
+  permission: 'Needs permission', question: 'Has a question', reply: 'Waiting on you', crash: 'Unreal crashed', testing: 'Ready to test', error: 'Hit an error', blocked: 'Blocked',
 };
 
 export function AttentionPopup() {
@@ -334,6 +334,7 @@ function ApiCredits() {
 export function MachinesModal() {
   const open = useStore((s) => s.modal === 'machines');
   const machines = useStore((s) => s.snapshot.machines);
+  const preferred = useStore((s) => s.snapshot.preferredMachine);
   const pairing = useStore((s) => s.snapshot.pairing);
   const hostAppPath = useStore((s) => s.snapshot.hostAppPath);
   const [copied, setCopied] = useState(false);
@@ -364,6 +365,16 @@ export function MachinesModal() {
           ) : <p className="final-warn">The link server isn't running.</p>}
         </section>
         <ApiCredits />
+        <section data-preferred>
+          <h3>Where work goes</h3>
+          <label className="preferred-machine">Preferred machine
+            <select data-preferred-machine value={preferred ?? ''} onChange={(e) => void window.fleet.call('setPreferredMachine', e.target.value || null)}>
+              <option value="">Automatic, by how busy each one is</option>
+              {machines.map((m) => <option key={m.info.id} value={m.info.id}>{m.info.name}{m.online ? '' : ' (offline)'}</option>)}
+            </select>
+          </label>
+          <p className="pair-note">The master chat sends new tasks here unless you name another machine, or this one can't take it, in which case the card says why.</p>
+        </section>
         <section>
           <h3>Linked</h3>
           <ul className="machine-list">

@@ -9,6 +9,7 @@ class InputQueue implements AsyncIterable<SDKUserMessage> {
   private wake: (() => void) | null = null;
   private closed = false;
   push(m: SDKUserMessage) { this.items.push(m); this.wake?.(); }
+  takeUnread() { return this.items.splice(0); }
   close() { this.closed = true; this.wake?.(); }
   async *[Symbol.asyncIterator]() {
     while (true) {
@@ -34,6 +35,9 @@ export interface RunnerConfig {
   additionalDirectories?: string[];
   disallowedTools?: string[];
   onFileEdited?: (file: string) => void;
+  // By default a conversation keeps the prompt it first had, even resumed with a new one. This session
+  // outlives new versions and its notes change, so it needs what's current.
+  freshPrompt?: boolean;
 }
 
 type Pending = { resolve: (r: PermissionResult) => void; input: Record<string, unknown>; suggestions?: PermissionUpdate[] };
@@ -81,7 +85,9 @@ export class AgentRunner {
   private apiKey: string | undefined;
   private usageLimit: { resetsAt?: number } | null = null;
   private creditsProblem: string | null = null;
-  private restarting: { carryOn?: string } | null = null;
+  private restarting: { carryOn?: string; arrived: SDKUserMessage[] } | null = null;
+  private sessionIdle = false;
+  private promptChanged = false;
   running = false;
 
   constructor(private cfg: RunnerConfig) {
@@ -108,7 +114,18 @@ export class AgentRunner {
     this.emit({ k: 'item', item: { kind: 'user', id: this.id('u'), at: Date.now(), text, images: shown.length ? shown : undefined, broadcastId, from } });
     this.emit({ k: 'attention-clear' });
     this.emit({ k: 'activity', status: 'working', bucket: 'thinking' });
-    this.input.push({ type: 'user', message: { role: 'user', content }, parent_tool_use_id: null } as SDKUserMessage);
+    const message = { type: 'user', message: { role: 'user', content }, parent_tool_use_id: null } as SDKUserMessage;
+    // A session on its way out would take it and never answer. With nothing in flight, this is also
+    // the safe moment to pick up a new prompt, and this message goes to the session that has it.
+    if (this.restarting) this.restarting.arrived.push(message);
+    else if (this.promptChanged && this.q && this.sessionIdle) {
+      this.promptChanged = false;
+      this.restarting = { arrived: [message] };
+      this.q.close();
+    } else {
+      this.sessionIdle = false;
+      this.input.push(message);
+    }
     if (!this.running && !this.stopped && this.q === null && this.started) void this.loop();
   }
 
@@ -135,11 +152,11 @@ export class AgentRunner {
           allowedTools,
           additionalDirectories: this.cfg.additionalDirectories,
           disallowedTools: this.cfg.disallowedTools,
-          systemPrompt: { type: 'preset', preset: 'claude_code', append: appendPrompt },
+          systemPrompt: { type: 'preset', preset: 'claude_code', append: appendPrompt, ...(this.cfg.freshPrompt && { snapshot: false }) },
           settingSources: ['user', 'project', 'local'],
           settings: this.cfg.memoryDir ? { autoMemoryDirectory: this.cfg.memoryDir } : undefined,
           pathToClaudeCodeExecutable: claudePath ?? undefined,
-          env: this.apiKey ? { ...agentEnv(), ANTHROPIC_API_KEY: this.apiKey } : agentEnv(),
+          env: { ...agentEnv(), CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1', ...(this.apiKey && { ANTHROPIC_API_KEY: this.apiKey }) },
           canUseTool: (name, input, opts) => this.onPermission(name, input, opts as any),
           stderr: (d) => { if (/error|fatal/i.test(d)) console.error(`[agent ${spawn.id}]`, d.trim()); },
         },
@@ -156,10 +173,16 @@ export class AgentRunner {
     } finally {
       this.q = null;
       this.running = false;
+      this.sessionIdle = false;
+      const unread = this.input.takeUnread();
       this.input = new InputQueue();
       const restart = this.restarting;
       this.restarting = null;
+      // What arrived while it was restarting still gets answered.
+      const waiting = restart ? [...unread, ...restart.arrived] : [];
+      for (const m of waiting) this.input.push(m);
       if (restart?.carryOn) this.send(restart.carryOn, undefined, undefined, 'UE Fleet');
+      else if (waiting.length && !this.stopped) void this.loop();
     }
   }
 
@@ -182,7 +205,9 @@ export class AgentRunner {
   }
 
   private onSystem(m: any) {
-    if (m.subtype === 'init') {
+    if (m.subtype === 'session_state_changed') {
+      this.sessionIdle = m.state === 'idle';
+    } else if (m.subtype === 'init') {
       this.sessionId = m.session_id;
       this.emit({ k: 'session', sessionId: m.session_id, model: m.model });
     } else if (m.subtype === 'compact_boundary') {
@@ -301,6 +326,13 @@ export class AgentRunner {
     this.emit({ k: 'turn-end', interrupted, isError, text });
   }
 
+  // A running session keeps the prompt it started with, so a new one means carrying on in a fresh
+  // process. That waits for the next message, when the session is known to have nothing in flight.
+  setAppendPrompt(text: string) {
+    this.cfg.appendPrompt = text;
+    this.promptChanged = !!this.q;
+  }
+
   private onPermission(toolName: string, input: Record<string, unknown>, opts: { signal: AbortSignal; suggestions?: PermissionUpdate[]; decisionReason?: string }): Promise<PermissionResult> {
     return new Promise((resolve) => {
       const id = this.id(toolName === 'AskUserQuestion' ? 'q' : 'p');
@@ -344,7 +376,7 @@ export class AgentRunner {
   useCredits(apiKey: string | null, carryOn?: string) {
     this.apiKey = apiKey ?? undefined;
     if (this.q) {
-      this.restarting = { carryOn };
+      this.restarting = { carryOn, arrived: [] };
       this.q.close();
     } else if (carryOn) this.send(carryOn, undefined, undefined, 'UE Fleet');
   }

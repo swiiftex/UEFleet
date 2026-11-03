@@ -35,9 +35,11 @@ Everything you type with `Ctrl+N` goes to the master chat, one long Claude sessi
 
 It can't edit files, and it doesn't do the task itself. If it can't run, your request starts anyway, on its own, so nothing gets lost.
 
-**Placement** is automatic unless you pick a machine. A task goes to another PC when one is free, meaning CPU under 60% and at least 12 GB of RAM free, with room for another editor and a copy of the project. Otherwise it stays on this PC. If this PC is out of room too, it goes to the least busy machine, even if that means sending the project. The card says why it ended up where it did.
+**Placement** is automatic unless you pick a machine for a task or set a **Preferred machine** under Machines. A preferred machine gets the work unless it can't take it, because it's offline, doesn't have the project, is full or is out of CPU or RAM. Then the task is placed as usual, and the card says why. Otherwise, a task goes to another PC when one is free, meaning CPU under 60% and at least 12 GB of RAM free, with room for another editor and a copy of the project. Otherwise it stays on this PC. If this PC is out of room too, it goes to the least busy machine, even if that means sending the project. The card says why it ended up where it did.
 
 **Its permissions:** it starts out asking first. Change that with the dropdown at the top of its chat or by telling it, such as "switch to auto". The change applies straight away and stays through a restart.
+
+**Its memory:** tell it how you want things done from now on, such as "always start changelist names with the ticket number" or "prefer the laptop for long builds", and it follows that in every session. Each note appears in its chat when it's saved, and **Memory** at the top of its chat lists them so you can add or remove any. Only you can set them: a ticket or an agent asking it to remember something is ignored, and a note can't change its rules, such as never checking in unless asked. They're kept in `master-memory.md` in the data folder.
 
 **Managing the fleet:** you can also tell it what to do with the agents, such as "put everything on xhigh and auto" or "stop 4 and archive 5". It can change a running agent's model, effort and permissions, which apply from its next model call, as well as interrupt, stop, archive, approve, send back with an issue, open the test editor, settle merge conflicts, stop editors, set how many editors a machine runs, and restart a machine into a waiting update. It won't archive work that would be lost without asking you, and it can't turn on **Bypass all prompts**, because it reads tickets and documents that shouldn't be able to talk it into that. Pick that in New Task instead.
 
@@ -48,6 +50,10 @@ It can't edit files, and it doesn't do the task itself. If it can't run, your re
 It never happens mid-task. If unfinished work is in that workspace, the update waits and runs once it's done, and a new task there starts from what's on disk in the meantime. Before updating, every pending change there is checked. One that's identical to a checked-in version, or to what already reached this PC, gets cleared. Anything else stops the update and is listed for you, because undoing a change in Plastic can't be taken back. Files that aren't under source control are left alone. So is this PC's workspace, because you work in it: that's what the workspace chat is for.
 
 **Agents asking back:** this PC may be the only one logged into Jira, Codevelop and the like. Any agent, on any machine, can call `ask_master`, and it waits while the master looks the answer up, asking you first if only you know. If the app restarts in the meantime, the question gets asked again.
+
+## Usage left
+
+The top bar shows how much of your subscription's session and weekly limits is left on this PC's Claude login, refreshed every 3 minutes, and it turns amber or red when the server says it's getting low. Hover over it for when each limit resets, and for any limit on a particular model. Reading it uses no tokens. It's hidden when this PC is signed in with an API key rather than a plan, or if the numbers can't be read for 15 minutes.
 
 ## API credits
 
@@ -63,9 +69,9 @@ This is separate from extra usage on your Claude plan, which is an account setti
 
 Agents work directly in your project folder, so a new task starts straight away. Each one's editor is started with `-UserDir`, which moves its `Saved` and `Intermediate` folders to a folder of its own in the app's data. Its logs, settings, autosaves and crash reports stay there, and the app adds nothing to your project.
 
-That folder starts with your project's asset registry cache, linked rather than copied, so a first boot doesn't have to read every asset again. On Night Crew that takes two editors from 190 seconds to 50. Once the editor writes its own cache the folder is about 450 MB, and the next task reuses it.
+That folder starts with your project's asset registry cache, linked rather than copied, so a first boot doesn't have to read every asset again. On a large project that takes two editors from 190 seconds to 50. Once the editor writes its own cache the folder is about 450 MB, and the next task reuses it.
 
-A project's own plugins may still write to its folder whenever an editor starts, as Wwise and RiderLink do on Night Crew. Plastic doesn't count those as changes, but they do appear on the **Files** tab.
+A project's own plugins may still write to its folder whenever an editor starts, as Wwise and RiderLink do. Plastic doesn't count those as changes, but they do appear on the **Files** tab.
 
 Each editor also gets its own MCP port, PIE port and log through command-line overrides, and your project files aren't edited to do it. Agents reach their editor through their own tools, and `strictMcpConfig` keeps every other MCP server away from them, including anything that could reach your real editor.
 
@@ -106,9 +112,29 @@ The panel at the top of each task always shows which stage it's at, where its fi
 | **Checking in** | The master chat puts them in a named Plastic changelist |
 | **Complete** | Done. You check the changelist in from Plastic when you're ready |
 
-**Checking in never checks anything in.** It only sorts the files into a changelist. Plastic only accepts checked-out and added files in a changelist, so plain edits get checked out and new files added first, which also takes any lock your team uses. A file someone else has locked is reported on the card.
+**Checking in never checks anything in.** It only sorts the files into a changelist. Plastic only accepts checked-out and added files in a changelist, so plain edits get checked out and new files added first, which also takes any lock your team uses.
 
 A project that isn't in Plastic goes straight from Merged to Complete.
+
+### Blocked on a locked package
+
+In a Plastic workspace, an agent checks every `.uasset` and `.umap` against source control before changing it. If one is locked, it looks for a way to do the task without it. If there isn't one, its card turns red and says **BLOCKED**, and the panel at the top says who has the package, on which branch, and why the task needs it. The same check runs before a finished task's files merge, in case something got locked in the meantime or the agent changed a package without asking.
+
+UE Fleet checks again every 30 seconds, and **Check again** does it straight away:
+
+- **The lock is gone:** the agent gets a message to carry on, or finished work moves on to the merge.
+- **Someone has it checked out:** nothing can be done yet, so it waits for them to check it in.
+- **They've checked it in on their branch:** Plastic keeps the file locked until that reaches the branch the lock is for, usually `/main`. UE Fleet merges their check-in into your current branch, and the agent carries on with their version.
+
+That merge never checks anything in, and it doesn't happen if:
+
+- Another agent on that project is mid-task. It waits for them, or **Pause them and merge now** pauses them for it.
+- You have an editor open on the project.
+- Anything in that check-in also has changes in your workspace, or needs a decision, such as a binary file changed on both sides. The card says which, and that it's free once they merge their branch.
+
+A merge brings in the whole changeset, not just the one package, so the note on the card says how many files came with it. Plastic lists them as `Cherrypicking from cs:<number>`, and won't check in anything else until they go in, on their own or along with your work.
+
+**Carry on anyway** stops waiting, and the agent or the merge goes ahead. The lock may then stop your check-in until it's released. Messaging a blocked agent also ends its wait, so you can tell it another way to do the task.
 
 ### Testing
 
@@ -126,11 +152,11 @@ A text file that also changed in your workspace gets a three-way merge, like ver
 
 It only pauses for you when both sides changed the same lines, when a binary such as an asset changed on both sides, or when there's nothing to merge from, as with a new file on both sides. Then you pick **Use the agent's changes**, **Keep mine** or **Try merging again**. Using the agent's changes settles only the lines in dispute in its favour, and everything else in your file stays. Only a binary, or a file with nothing to merge from, is replaced whole.
 
-Each agent keeps track of which files are its own: what its tools edited, what its editor saved, and what it says it changed when it finishes. A change made some other way that it doesn't report won't be merged or go in the changelist. The **Files** tab shows that list, and can also scan for everything that changed in the folder. On Night Crew that scan takes about half a minute, and it can't show deleted files.
+Each agent keeps track of which files are its own: what its tools edited, what its editor saved, and what it says it changed when it finishes. A change made some other way that it doesn't report won't be merged or go in the changelist. The **Files** tab shows that list, and can also scan for everything that changed in the folder. On a large project that scan takes about half a minute, and it can't show deleted files.
 
 ### Projects sent from the master
 
-A project that was sent to another machine, because that machine had no copy of its own, is the one case that doesn't share. Sending it again would overwrite the folder, and each agent's work has to find its way back, so each agent there gets its own copy. Content and other files that never change in place are hardlinked, so they cost no disk, and source, config and build outputs are real copies. Night Crew measures 94 GB linked and 1.5 GB copied per agent. Run `node scripts/measure-project.mjs <project folder>` to see the numbers for another project.
+A project that was sent to another machine, because that machine had no copy of its own, is the one case that doesn't share. Sending it again would overwrite the folder, and each agent's work has to find its way back, so each agent there gets its own copy. Content and other files that never change in place are hardlinked, so they cost no disk, and source, config and build outputs are real copies. A large project can measure 94 GB linked and 1.5 GB copied per agent. Run `node scripts/measure-project.mjs <project folder>` to see the numbers for another project.
 
 UE saves an asset by replacing the file, so a save in one copy never reaches another copy or the project. When one merges, a file that also changed in your project gets a three-way merge if it's text, and pauses for you if it's binary or the merge fails. Merges work on bytes, so line endings and non-UTF-8 characters survive.
 

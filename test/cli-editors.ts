@@ -69,6 +69,8 @@ const SCRIPTS: Record<string, Step[]> = {
   asks: [{ tool: { name: 'mcp__fleet__ask_master', input: { question: 'What does NIGH-1 say? [script:master-answer]' } } }, fin('$LAST_RESULT', ['Asked the master']), { text: 'Done.' }],
   'master-switch': [{ tool: { name: 'mcp__fleet__set_agent_options', input: { agents: ['$AGENT'], model: 'claude-opus-5-5', effort: 'xhigh', permission_mode: 'acceptEdits' } } }, { text: 'Switched.' }],
   'after-switch': [{ tool: { name: 'Write', input: { file_path: 'switched.txt', content: 'written with no prompt\n' } } }, fin('Wrote it.', ['Checked the file']), { text: 'Done.' }],
+  'master-remember': [{ tool: { name: 'mcp__fleet__remember', input: { text: 'Always say fleet-memory-note-4417' } } }, { text: 'Noted.' }],
+  'master-recall': [{ text: 'Still here.' }],
   'master-mode': [{ tool: { name: 'mcp__fleet__set_own_permissions', input: { mode: 'auto' } } }, { text: 'Switched myself.' }],
   'limit-hit': [fin('Carried on.', ['Checked it']), { text: 'Done.' }],
   'limit-billing': [{ text: 'Never reached.' }],
@@ -262,7 +264,7 @@ try {
     check('the model receives it as an image block, not base64 text', blob.includes('"type":"image"') && !/"data\\":\\"[A-Za-z0-9+/]{2000}/.test(blob));
   }
   const tl = seen.find((s) => s.marker === 'pie-a')!.tools;
-  check('agents get the fleet tools', tl.includes('mcp__fleet__ue_call') && tl.includes('mcp__fleet__finish_task') && tl.includes('mcp__fleet__report_progress'), tl.slice(0, 40));
+  check('agents get the fleet tools', tl.includes('mcp__fleet__ue_call') && tl.includes('mcp__fleet__finish_task') && tl.includes('mcp__fleet__report_progress') && tl.includes('mcp__fleet__check_packages') && tl.includes('mcp__fleet__report_blocked'), tl.slice(0, 40));
   check('and are told to report progress', sysFor('pie-a').includes('Call report_progress'));
   check('agents cannot see any other Unreal MCP server', !tl.some((t) => t.startsWith('mcp__') && !t.startsWith('mcp__fleet__')), tl.filter((t) => t.startsWith('mcp__')));
   const sys = JSON.stringify(systemSeen.get('pie-a') ?? '');
@@ -304,7 +306,8 @@ try {
   check('an offscreen editor has no window to steal focus', windowHandle === '0', windowHandle);
 
   process.kill(pid);
-  await sleep(1500);
+  // A large process takes a while to go when the machine is busy.
+  for (let i = 0; i < 300 && slot.state !== 'crashed'; i++) await sleep(100);
   check('a killed editor is seen as crashed', slot.state === 'crashed', slot.state);
   check('and gives its place back', hub.local!.slots.editors.inUse === 0, hub.local!.slots.editors.inUse);
   await slot.ensureEditor();
@@ -387,12 +390,26 @@ try {
   for (let i = 0; i < 900 && !hub.transcript('master-chat').some((t: Item) => t.kind === 'assistant' && t.text.includes('Switched myself')); i++) await sleep(100);
   check('asked to, the master changes its own permissions mid-session, and carries on', card('master-chat').permissionMode === 'auto' && hub.transcript('master-chat').some((t: Item) => t.kind === 'assistant' && t.text.includes('Switched myself')), tools('master-chat').at(-1));
 
+  const masterSaid = (text: string) => hub.transcript('master-chat').some((t: Item) => t.kind === 'assistant' && t.text.includes(text));
+  await hub.send('master-chat', 'From now on, say the note [script:master-remember]');
+  for (let i = 0; i < 900 && !masterSaid('Noted.'); i++) await sleep(100);
+  check('told to remember something, the master saves it through the real tools', masterSaid('Noted.') && (hub.snapshot().masterMemory ?? []).includes('Always say fleet-memory-note-4417'), hub.snapshot().masterMemory);
+  // Let it finish, because a message that arrives before it's idle stays with the old prompt for that turn.
+  for (let i = 0; i < 100 && card('master-chat').status !== 'idle'; i++) await sleep(100);
+  await sleep(1000);
+  await hub.send('master-chat', 'Are you there? [script:master-recall]');
+  for (let i = 0; i < 900 && !masterSaid('Still here.'); i++) await sleep(100);
+  check('its next turn has the note in its instructions', masterSaid('Still here.') && sysFor('master-recall').includes('fleet-memory-note-4417'), sysFor('master-recall').slice(-300));
+  check('and carries on the same conversation', JSON.stringify(seen.filter((s) => s.marker === 'master-recall').at(-1)?.messages).includes('From now on, say the note'));
+  hub.removeMasterMemory(0);
+
   log('The workspace chat');
   (hub as any).local.addProject(PROJECT);
   (hub as any).defaults.projectFile = PROJECT;
   await hub.send('master-chat', 'Open a workspace chat [script:master-workspace]');
   let wsCard: any;
   for (let i = 0; i < 900 && !wsCard; i++) { wsCard = hub.snapshot().cards.find((c: any) => c.isWorkspace && !c.archived); await sleep(100); }
+  if (!wsCard) log('The master chat at this point:', card('master-chat').status, JSON.stringify(card('master-chat').attention), JSON.stringify(hub.transcript('master-chat').slice(-8).map((t: Item) => [t.kind, String(t.text ?? t.name ?? '').slice(0, 200), t.tone, t.result ? String(t.result).slice(0, 200) : undefined])));
   check('the master opens a workspace chat through the real tools', !!wsCard && wsCard.project === path.basename(PROJECT, '.uproject'), tools('master-chat').at(-1));
   const doneWs = await waitFor(wsCard.id, (c) => c.attention?.kind === 'reply' || c.status === 'idle', 'the workspace chat', 120_000);
   const heldTool = tools(wsCard.id).find((t) => t.name === 'mcp__fleet__hold_workspace');

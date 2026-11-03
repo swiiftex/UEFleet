@@ -4,7 +4,7 @@ import { fmtAgo, fmtDuration, fmtShort, fmtTokens, pad2, select, setState, useSt
 
 export const STATUS_LABEL: Record<AgentStatus, string> = {
   queued: 'QUEUED', provisioning: 'PREPARING', working: 'WORKING', tools: 'TOOLS', coding: 'CODING', building: 'BUILDING', testing: 'TESTING',
-  'waiting-instance': 'WAITING', attention: 'NEEDS YOU', idle: 'IDLE', finished: 'FINISHED', error: 'ERROR', stopped: 'STOPPED',
+  'waiting-instance': 'WAITING', attention: 'NEEDS YOU', blocked: 'BLOCKED', idle: 'IDLE', finished: 'FINISHED', error: 'ERROR', stopped: 'STOPPED',
 };
 
 export const SLOT_LABEL: Record<SlotInfo['state'], string> = {
@@ -49,14 +49,14 @@ export function BucketBar({ buckets }: { buckets: Record<ActivityBucket, number>
 // Stopped and failed say so, since those aren't places in the flow. Anything else is where it's up to,
 // plus whether it's waiting on you.
 export function stageLabel(c: AgentCard) {
-  if (c.status === 'stopped' || c.status === 'error') return STATUS_LABEL[c.status];
+  if (c.status === 'stopped' || c.status === 'error' || c.status === 'blocked') return STATUS_LABEL[c.status];
   const stage = FLOW_STAGES.find((s) => s.id === c.stage)?.label.toUpperCase() ?? STATUS_LABEL[c.status];
   return c.attention ? `${stage} · NEEDS YOU` : stage;
 }
 
 export function FlowSteps({ c, labelled }: { c: AgentCard; labelled?: boolean }) {
   const at = FLOW_STAGES.findIndex((s) => s.id === (c.stage ?? 'preparing'));
-  const paused = !!c.attention || c.status === 'stopped' || c.status === 'error';
+  const paused = !!c.attention || c.status === 'stopped' || c.status === 'error' || c.status === 'blocked';
   return (
     <ol className={`flow-steps${labelled ? ' labelled' : ''}`} aria-label={`Stage: ${FLOW_STAGES[at]?.label}`}>
       {FLOW_STAGES.map((s, i) => <li key={s.id} title={s.label} className={i < at ? 'done' : i === at ? (c.stage === 'complete' ? 'done' : paused ? 'now paused' : 'now') : ''}>{labelled && <span>{s.label}</span>}</li>)}
@@ -92,6 +92,7 @@ function TaskProgress({ c }: { c: AgentCard }) {
 function StatusGlyph({ c }: { c: AgentCard }) {
   if (c.status === 'finished') return <span className="glyph glyph-done">✓</span>;
   if (c.status === 'attention') return <span className="glyph glyph-attn">!</span>;
+  if (c.status === 'blocked') return <span className="glyph glyph-blocked">■</span>;
   if (c.status === 'error') return <span className="glyph glyph-err">×</span>;
   if (isLive(c)) return <span className="glyph-ring" />;
   return <span className="glyph glyph-idle">·</span>;

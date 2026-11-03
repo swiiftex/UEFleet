@@ -362,6 +362,25 @@ await step('Approve takes a tested task through to complete, and says where thin
   await page.screenshot({ path: path.join(shots, '16-complete.png') });
 });
 
+await step('a blocked task goes red, says who has the package, and carries on when it is free', async () => {
+  const id = await spawn('blocked', 'Sprinkler timing');
+  await page.click(`[data-card="${id}"]`);
+  await page.waitForSelector('[data-blocked]', { timeout: 20000 });
+  const status = () => page.evaluate((i) => document.querySelector(`[data-card="${i}"] .card-status`).innerText, id);
+  await until(async () => (await status()) === 'BLOCKED', 'the BLOCKED label');
+  assert.equal(await page.evaluate((i) => getComputedStyle(document.querySelector(`[data-card="${i}"]`)).getPropertyValue('--accent').trim(), id), await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--red').trim()));
+  assert.match(await flowText(), /Blocked: BP_Sprinkler\.uasset is locked by sam@example\.com/);
+  assert.match(await page.evaluate(() => document.querySelector('[data-lock-holder]').innerText), /Checked in by sam@example\.com on \/main\/sam, and locked until that reaches \/main/);
+  assert.match(await page.evaluate(() => document.querySelector('.blocked-why').innerText), /only in this Blueprint/);
+  await page.screenshot({ path: path.join(shots, '17-blocked.png') });
+  await page.click('[data-check-blocked]');
+  await page.waitForSelector('[data-blocked]', { state: 'detached' });
+  await until(async () => (await status()) !== 'BLOCKED', 'it to stop being blocked');
+  await until(() => page.evaluate(() => document.querySelector('.transcript').innerText.includes("isn't locked any more")), 'the agent to hear');
+  await until(() => page.evaluate((i) => window.fleet.call('snapshot').then((s) => !!s.cards.find((c) => c.id === i).attention), id), 'its reply');
+  await dismissIfWaiting(id);
+});
+
 await step('Open editor explains itself when it can not run', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-ui-project-'));
   const file = path.join(dir, 'NoEngine.uproject');
@@ -454,6 +473,53 @@ await step("the master chat's permissions can be changed from the top of its cha
   await until(async () => (await master()) === 'auto', 'it to change');
   await until(() => page.$eval('[data-master-mode]', (e) => e.value === 'auto'), 'the screen to show it');
   await page.screenshot({ path: path.join(shots, '19-master-mode.png') });
+});
+
+await step("the master chat's memory is in view at the top of its chat, to add to and remove from", async () => {
+  await page.keyboard.press('Control+0');
+  await page.waitForSelector('[data-memory-toggle]');
+  assert.match(await page.$eval('[data-memory-toggle]', (e) => e.innerText), /Memory \(0\)/);
+  await page.click('[data-memory-toggle]');
+  await page.fill('[data-memory-input]', 'Always try 1 thing at a time');
+  await page.press('[data-memory-input]', 'Enter');
+  await page.waitForSelector('[data-memory-remove="0"]');
+  assert.equal(await page.$eval('[data-memory-input]', (e) => e.value), '', 'the box is emptied');
+  assert.match(await page.$eval('.memory-list', (e) => e.innerText), /Always try 1 thing at a time/);
+  assert.deepEqual((await page.evaluate(() => window.fleet.call('snapshot'))).masterMemory, ['Always try 1 thing at a time']);
+  assert.match(fs.readFileSync(path.join(dataDir, 'master-memory.md'), 'utf8'), /- Always try 1 thing at a time/);
+  await until(() => page.evaluate(() => document.querySelector('.transcript')?.innerText.includes('Remembered: Always try 1 thing')), 'the chat to say so');
+  await page.screenshot({ path: path.join(shots, '20-master-memory.png') });
+  await page.click('[data-memory-remove="0"]');
+  await page.waitForSelector('[data-memory-remove="0"]', { state: 'detached' });
+  await page.click('[data-memory-toggle]');
+  assert.match(await page.$eval('[data-memory-toggle]', (e) => e.innerText), /Memory \(0\)/);
+});
+
+await step('the top bar shows how much usage is left, with when each limit resets', async () => {
+  await page.waitForSelector('[data-usage-left]');
+  const text = await page.$eval('[data-usage-left]', (e) => e.innerText);
+  assert.match(text, /usage left/i);
+  assert.match(text, /session 62%/i);
+  assert.match(text, /week 12%/i);
+  assert.doesNotMatch(text, /fable/i, 'only what applies to everything, or the bar gets crowded');
+  const title = await page.$eval('[data-usage-left]', (e) => e.title);
+  assert.match(title, /Session: 62% left, resets/);
+  assert.match(title, /Fable weekly: 100% left/);
+  assert.equal(await page.$eval('[data-usage-left] .usage-warning', (e) => e.innerText.toLowerCase()), 'week 12%', 'the server says that one is getting low');
+});
+
+await step('the preferred machine for work is set under Machines, and new tasks go there', async () => {
+  await page.click('.topbar button:has-text("machines")');
+  await page.waitForSelector('[data-preferred-machine]');
+  assert.equal(await page.$eval('[data-preferred-machine]', (e) => e.value), '');
+  await page.selectOption('[data-preferred-machine]', 'master');
+  await until(async () => (await page.evaluate(() => window.fleet.call('snapshot'))).preferredMachine === 'master', 'it to be set');
+  await until(() => page.$eval('[data-preferred-machine]', (e) => e.value === 'master'), 'the screen to show it');
+  await page.screenshot({ path: path.join(shots, '21-preferred-machine.png') });
+  await page.selectOption('[data-preferred-machine]', '');
+  await until(async () => (await page.evaluate(() => window.fleet.call('snapshot'))).preferredMachine === null, 'it to clear');
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('[data-machines]', { state: 'detached' });
 });
 
 await step('Use API credits needs a working key, and the key never comes back to the screen', async () => {

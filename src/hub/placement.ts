@@ -27,7 +27,27 @@ function load(m: MachineView, agents: number) {
   return Math.max(m.stats?.cpu ?? 100, m.stats ? (100 * m.stats.ramUsedGb) / m.info.ramGb : 100, (100 * agents) / Math.max(1, m.info.maxInstances));
 }
 
-export function placeTask(machines: MachineView[], running: (nodeId: string) => number, project: ProjectInfo | null): Placement {
+// What stops a machine taking work, however much it's wanted there. Nothing means it can.
+function whyNotPreferred(m: MachineView, running: (nodeId: string) => number, project: ProjectInfo | null) {
+  if (!m.online) return "it's offline";
+  if (!canRun(m, project)) return `it can't run ${project ? project.name : 'tasks'} right now`;
+  if (!hasCopy(m, project)) return `it doesn't have ${project!.name}`;
+  if (running(m.info.id) >= m.info.maxInstances) return `it's already running ${m.info.maxInstances} tasks`;
+  if (m.stats && m.stats.cpu >= BUSY_CPU_PERCENT) return `its CPU is at ${m.stats.cpu}%`;
+  if (m.stats && freeRamGb(m) < FREE_RAM_FOR_A_TASK_GB) return `it only has ${freeRamGb(m)} GB free`;
+  return null;
+}
+
+export function placeTask(machines: MachineView[], running: (nodeId: string) => number, project: ProjectInfo | null, preferred?: string | null): Placement {
+  const wanted = machines.find((m) => m.info.id === preferred);
+  if (!wanted) return placeByLoad(machines, running, project);
+  const why = whyNotPreferred(wanted, running, project);
+  if (!why) return { nodeId: wanted.info.id, reason: `${wanted.info.name} is your preferred machine.` };
+  const placed = placeByLoad(machines, running, project);
+  return { ...placed, reason: `${wanted.info.name} is your preferred machine, but ${why}. ${placed.reason}` };
+}
+
+function placeByLoad(machines: MachineView[], running: (nodeId: string) => number, project: ProjectInfo | null): Placement {
   const master = machines.find((m) => m.info.role === 'master');
   const usable = machines.filter((m) => canRun(m, project));
   const isFree = (m: MachineView) => !!m.stats && m.stats.cpu < LOW_CPU_PERCENT && freeRamGb(m) >= FREE_RAM_FOR_A_TASK_GB && running(m.info.id) < m.info.maxInstances;

@@ -14,7 +14,7 @@ if (process.env.FLEET_DATA) app.setPath('userData', path.join(dataDir, 'window')
 const CALLABLE = new Set([
   'snapshot', 'createAgent', 'request', 'send', 'broadcast', 'decide', 'answer', 'interrupt', 'stopAgent', 'archive',
   'dismissAttention', 'transcript', 'setTestDone', 'addProject', 'setMaxInstances', 'rotatePairing',
-  'forgetMachine', 'changes', 'log', 'stopInstance', 'testChanges', 'approve', 'reportIssue', 'resolveConflicts', 'restartHost', 'setApiCreditsEnabled', 'releaseWorkspace', 'setMasterPermissions',
+  'forgetMachine', 'changes', 'log', 'stopInstance', 'testChanges', 'approve', 'reportIssue', 'resolveConflicts', 'restartHost', 'setApiCreditsEnabled', 'releaseWorkspace', 'setMasterPermissions', 'addMasterMemory', 'removeMasterMemory', 'setPreferredMachine', 'checkBlocked', 'mergeBlockedNow', 'carryOnPastBlock',
 ]);
 
 let win: BrowserWindow | null = null;

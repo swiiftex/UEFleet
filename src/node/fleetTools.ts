@@ -2,8 +2,10 @@
 // port or path to get wrong and no way to reach another agent's editor.
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import type { FinalReport, HumanTest } from '../shared/protocol';
+import { describeLock, type FinalReport, type HumanTest, type PackageLock } from '../shared/protocol';
 import type { Slot } from './instance';
+import { isPlasticWorkspace } from './plastic';
+import { packageFile, packageLocks } from './sourceControl';
 
 // Without this the CLI hides MCP tools behind tool search, and an agent could miss finish_task.
 const always: typeof tool = (name, description, schema, handler) => tool(name, description, schema, handler, { alwaysLoad: true });
@@ -12,7 +14,7 @@ const text = (t: string, isError = false) => ({ content: [{ type: 'text' as cons
 
 export const FLEET_TOOLS = [
   'ue_status', 'ue_list_toolsets', 'ue_describe_toolset', 'ue_call', 'ue_build', 'ue_run_tests',
-  'ue_launch_game', 'ue_stop_games', 'ue_log', 'ue_crash', 'ue_stop', 'report_progress', 'ask_master', 'finish_task', 'hold_workspace', 'release_workspace',
+  'ue_launch_game', 'ue_stop_games', 'ue_log', 'ue_crash', 'ue_stop', 'report_progress', 'ask_master', 'finish_task', 'hold_workspace', 'release_workspace', 'check_packages', 'report_blocked',
 ].map((n) => `mcp__fleet__${n}`);
 
 const SHARED_FOLDER = (slot: Slot) => `You're working directly in the user's project at ${slot.dir}. Other agents on this machine work in the same files, and the user may be too. Whatever you save is in their workspace straight away, with nothing to apply afterwards. Your own editor keeps its logs, settings and saves in ${slot.own}, so you never queue for Play In Editor.`;
@@ -38,6 +40,9 @@ These files are shared with the user and with other agents, but unlike those age
 const ASKING_THE_MASTER = `# Asking the master
 This machine may not be logged into Jira, Codevelop or the other services the user works with, and your tools here can't reach them. The master chat, on the user's main PC, can. When you need a ticket, a design note or anything else from those, call ask_master with a specific question instead of guessing. It waits for the answer, which may take a while if the master has to ask the user. Use AskUserQuestion for decisions only the user can make.`;
 
+const LOCKED_PACKAGES = `# Locked packages
+Packages such as .uasset and .umap files can't be merged, so someone can hold a lock on one in source control, and a change to it then can't be checked in. Call check_packages with every package you expect to change before you change any of them. If one is locked, look for a way to do the task without changing it, such as doing the work in code, in a new asset or in a data table. If there's no such way, don't change it: call report_blocked and end your turn. The user sees who has it, UE Fleet merges in their check-in if it can, and you get a message when you can carry on.`;
+
 const WORKSPACE_CHAT = `# You are the workspace chat
 The user opened you to change the workspace as a whole, such as merging branches, switching or updating, or settling a merge. Other agents are forbidden from doing this, and you're allowed to. You're a chat rather than a task, so there's no progress bar or finish_task. End your turn when you've done what was asked or you need the user.
 
@@ -55,6 +60,10 @@ While you do it:
 Afterwards:
 - If code changed, run ue_build, and say if it fails.
 - Call release_workspace with one line on what changed, so the agents carry on knowing about it. Stay on hold while you're waiting for the user in the middle of a merge, and tell them the agents are paused.`;
+
+// A private copy isn't a workspace itself, but the project it came from may be.
+const lockDir = (slot: Slot) => (isPlasticWorkspace(slot.dir) ? slot.dir : slot.project.dir);
+const locksOn = (slot: Slot, names: string[]) => packageLocks(lockDir(slot), names.map((n) => packageFile(lockDir(slot), n)));
 
 export function appendPrompt(slot: Slot | null, projectNotes?: string, workspace?: boolean) {
   const instance = slot ? `
@@ -76,7 +85,7 @@ The project's CLAUDE.md and memory notes were mostly written for someone working
 ` : '';
   const notes = projectNotes ? `\n# Notes for this project\n${projectNotes}\n` : '';
   if (workspace) return `${instance}${notes}\n${ASKING_THE_MASTER}\n\n${WORKSPACE_CHAT}`;
-  return `${instance}${notes}
+  return `${instance}${notes}${slot && isPlasticWorkspace(lockDir(slot)) ? `\n${LOCKED_PACKAGES}\n` : ''}
 # Progress
 Your card shows a progress bar. Call report_progress with a rough percentage of the whole task as soon as you have a sense of its size, then again at each real step forward, such as finding the cause, getting a build through or passing a test. Don't call it after every small action. A rough guess is fine, and it can go down if the job turns out bigger. You don't need to reach 100, because finish_task fills the bar. If the user gives you more to do after you've finished, the bar starts again, so report on the new work.
 
@@ -116,7 +125,7 @@ export function liftImages(result: any) {
   return { ...result, content };
 }
 
-export function fleetServer(slot: Slot | null, onFinish: (r: FinalReport) => void, onProgress: (percent: number) => void, askMaster: (question: string) => Promise<string>, holdWorkspace?: (on: boolean, summary?: string) => Promise<string>) {
+export function fleetServer(slot: Slot | null, onFinish: (r: FinalReport) => void, onProgress: (percent: number) => void, askMaster: (question: string) => Promise<string>, onBlocked: (locks: PackageLock[], why: string) => void, holdWorkspace?: (on: boolean, summary?: string) => Promise<string>) {
   const needSlot = () => {
     if (!slot) throw new Error('This task has no Unreal project attached.');
     return slot;
@@ -191,6 +200,22 @@ export function fleetServer(slot: Slot | null, onFinish: (r: FinalReport) => voi
         always('report_progress', 'Say roughly how far through the whole task you are. It shows as a progress bar on your card.', {
           percent: z.number().min(0).max(100).describe('Rough percentage of the whole task done so far.'),
         }, guarded(async (a) => { onProgress(a.percent); return text('Recorded.'); })),
+        always('check_packages', "Check whether anyone holds a source control lock on packages you're about to change. Call it before changing any .uasset or .umap.", {
+          paths: z.array(z.string()).describe('The packages, as /Game/Maps/L_Test or as paths relative to the project.'),
+        }, guarded(async (a) => {
+          if (!isPlasticWorkspace(lockDir(needSlot()))) return text("This project isn't in a Plastic workspace, so there are no locks to check.");
+          const locks = await locksOn(needSlot(), a.paths);
+          return text(locks.length ? `Locked:\n${locks.map((l) => `- ${l.path}: ${describeLock(l)}`).join('\n')}\nDon't change these. Look for a way to do the task without them. If there isn't one, call report_blocked and end your turn.` : 'None of those are locked.');
+        })),
+        always('report_blocked', "Tell the user a locked package is stopping the task and there's no way around it. End your turn after this: you get a message when you can carry on.", {
+          paths: z.array(z.string()).describe('The locked packages the task needs.'),
+          why: z.string().describe('One sentence on why the task needs them and why nothing else will do.'),
+        }, guarded(async (a) => {
+          const locks = await locksOn(needSlot(), a.paths);
+          if (!locks.length) return text("None of those are locked now, so you aren't blocked. Carry on.");
+          onBlocked(locks, a.why);
+          return text('Recorded. The user can see who has them. End your turn here.');
+        })),
         always('finish_task', 'Report that the task is done. The user sees this as your final message.', {
           summary: z.string().describe('One or two sentences on what changed.'),
           files_changed: z.array(z.string()).optional().describe("Every file you changed, created or deleted in the project, including through scripts or your editor. Other agents' changes don't belong here."),

@@ -1,7 +1,7 @@
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { MASTER_PERMISSION_MODES, modelLabel, type AgentCard, type ChangedFile, type FinalReport, type ImageAttachment, type Question, type TranscriptItem } from '../shared/protocol';
+import { describeLock, MASTER_PERMISSION_MODES, modelLabel, type AgentCard, type BlockedState, type ChangedFile, type FinalReport, type ImageAttachment, type Question, type TranscriptItem } from '../shared/protocol';
 import { FlowSteps, isLive, stageLabel } from './Cards';
 import { fmtDuration, getState, isMessage, pad2, setMessagesOnly, useStore } from './store';
 
@@ -146,6 +146,7 @@ function flowText(c: AgentCard, machine: string) {
   const where = !c.slot ? null : inPlace ? 'your workspace' : c.slot.shared ? `the project folder on ${machine}` : `its private copy on ${machine}`;
   const merged = c.merge?.files ?? 0;
   if (c.status === 'stopped') return `Stopped.${where ? ` Its files are in ${where}.` : ''} Message it to carry on.`;
+  if (c.blocked) return `Blocked: ${c.attention?.text ?? 'a package it needs is locked.'}`;
   if (c.attention && !c.final) return `Paused: ${c.attention.text}`;
   switch (c.stage) {
     case 'preparing': return 'Getting ready. Nothing has changed yet.';
@@ -222,6 +223,21 @@ function Checklist({ card }: { card: AgentCard }) {
   );
 }
 
+function BlockedPanel({ card, blocked }: { card: AgentCard; blocked: BlockedState }) {
+  return (
+    <div className="blocked-panel" data-blocked>
+      <ul className="change-list">{blocked.locks.map((l) => <li key={`${l.path}:${l.by}`}><span className="chg-path">{l.path}</span><small data-lock-holder>{describeLock(l)}</small></li>)}</ul>
+      {blocked.why && <p className="blocked-why">{blocked.why}</p>}
+      {blocked.plan && <p className="blocked-plan" data-blocked-plan>{blocked.plan}</p>}
+      <div className="prompt-actions">
+        <button className="btn primary" onClick={() => void window.fleet.call('checkBlocked', card.id)} data-check-blocked>Check again</button>
+        {blocked.canPause && <button className="btn" onClick={() => void window.fleet.call('mergeBlockedNow', card.id)} data-merge-now>Pause them and merge now</button>}
+        <button className="btn" onClick={() => void window.fleet.call('carryOnPastBlock', card.id)} data-carry-on>Carry on anyway</button>
+      </div>
+    </div>
+  );
+}
+
 // Always at the top of a task, so there's one place that says what's going on and what you need to do.
 function FlowPanel({ card }: { card: AgentCard }) {
   const machine = useStore((s) => s.snapshot.machines.find((m) => m.info.id === card.nodeId)?.info.name ?? 'that machine');
@@ -230,6 +246,7 @@ function FlowPanel({ card }: { card: AgentCard }) {
     <section className="flow" data-flow={card.stage}>
       <FlowSteps c={card} labelled />
       <p className="flow-text" data-flow-text>{flowText(card, machine)}</p>
+      {card.blocked && <BlockedPanel card={card} blocked={card.blocked} />}
       {conflicts.length > 0 && (
         <div className="conflicts" data-conflicts>
           <ul className="change-list">{conflicts.map((c) => <li key={c.path}><span className="chg-path">{c.path}</span><small>{c.reason}</small></li>)}</ul>
@@ -388,6 +405,37 @@ function LogTab({ card }: { card: AgentCard }) {
   return <pre className="log" ref={ref}>{log || 'No editor log yet. The editor starts when the agent first needs it.'}</pre>;
 }
 
+// What the master chat follows in every session, all in view, because it shapes everything it does.
+function MasterMemory() {
+  const memory = useStore((s) => s.snapshot.masterMemory ?? []);
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState('');
+  const add = () => {
+    if (!text.trim()) return;
+    void window.fleet.call('addMasterMemory', text);
+    setText('');
+  };
+  return (
+    <div className="master-memory" data-master-memory>
+      <button className="link-btn" onClick={() => setOpen(!open)} data-memory-toggle aria-expanded={open}>{open ? 'Hide memory' : `Memory (${memory.length})`}</button>
+      {open && (
+        <>
+          <p className="memory-note">It follows these in every session. Tell it "from now on..." to add one, or add one here.</p>
+          {memory.length > 0 && (
+            <ol className="memory-list">
+              {memory.map((m, i) => <li key={m}><span>{m}</span><button className="link-btn" onClick={() => void window.fleet.call('removeMasterMemory', i)} data-memory-remove={i}>Remove</button></li>)}
+            </ol>
+          )}
+          <div className="memory-add">
+            <input data-memory-input value={text} placeholder="Always..." onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); add(); } }} />
+            <button className="btn" disabled={!text.trim()} onClick={add} data-memory-add>Add</button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 const PERMISSION_TEXT: Record<string, string> = { auto: 'auto', acceptEdits: 'accepts edits', default: 'asks', bypassPermissions: 'bypass' };
 
 // Archiving frees a private copy, which would wipe anything not merged yet. Work in a shared folder
@@ -440,6 +488,7 @@ export function DetailPanel() {
           )}
         </div>
       </header>
+      {card.isMaster && <MasterMemory />}
       {card.isWorkspace && (
         <div className="workspace-banner" data-workspace-banner>
           {card.holdingWorkspace ? 'Other agents on this project are paused while this chat changes the workspace.' : "This chat can merge, switch and update your real workspace. It asks before touching anyone's pending changes, and it doesn't check in unless you say to."}

@@ -8,10 +8,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
 import { Hub } from '../src/hub/hub';
+import { masterPrompt } from '../src/hub/masterChat';
 import { placeTask } from '../src/hub/placement';
 import { Slot, SlotManager, personEditors } from '../src/node/instance';
 import { readProject } from '../src/node/machine';
 import { assignToChangelist, parseStatus, type CmRun } from '../src/node/plastic';
+import { metersFrom } from '../src/node/planUsage';
 import { readChunk } from '../src/node/projectSync';
 import { checkedInVersion } from '../src/node/sourceControl';
 import { MASTER_CHAT_ID, type AgentCard, type EngineInfo, type MachineView, type NewTask } from '../src/shared/protocol';
@@ -91,6 +93,63 @@ test('a machine that cannot run it is never picked', () => {
 });
 
 // ---- The master chat ----
+
+test('a preferred machine gets the work whenever it can take it, and says why when it cannot', () => {
+  const fleet = [machine('master', 'master', 5), machine('laptop', 'remote', 40), machine('desk', 'remote', 10)];
+  assert.equal(placeTask(fleet, none, game).nodeId, 'desk', 'with no preference it goes by load');
+  const placed = placeTask(fleet, none, game, 'laptop');
+  assert.equal(placed.nodeId, 'laptop', 'even though another is less busy');
+  assert.match(placed.reason, /LAPTOP is your preferred machine\./);
+  assert.equal(placeTask(fleet, none, game, 'master').nodeId, 'master', 'this PC can be the one');
+
+  const refused = (m: MachineView, running: (id: string) => number = none) => placeTask([machine('master', 'master', 5), machine('desk', 'remote', 10), m], running, game, m.info.id);
+  const busy = refused(machine('laptop', 'remote', 95));
+  assert.equal(busy.nodeId, 'desk');
+  assert.match(busy.reason, /LAPTOP is your preferred machine, but its CPU is at 95%\. DESK is free/);
+  assert.match(refused({ ...machine('laptop', 'remote', 5), online: false }).reason, /but it's offline/);
+  assert.match(refused(machine('laptop', 'remote', 5, 4)).reason, /but it only has 4 GB free/);
+  assert.match(refused(machine('laptop', 'remote', 5, 40, ['Other'])).reason, /but it doesn't have Game/);
+  assert.match(refused(machine('laptop', 'remote', 5), (id) => (id === 'laptop' ? 4 : 0)).reason, /already running 4 tasks/);
+  assert.equal(placeTask(fleet, none, game, 'gone').nodeId, 'desk', 'one that has since gone is ignored');
+});
+
+test('the preferred machine is kept, reaches placement and the master, and clears if it is forgotten', async () => {
+  const dataDir = tmp('fleet-flow-');
+  const hub = new Hub({ dataDir, version: 'test', demo: true, hostAppPath: null });
+  assert.equal(hub.snapshot().preferredMachine, null);
+  assert.throws(() => hub.setPreferredMachine('nowhere'), /isn't linked/);
+  hub.setPreferredMachine('master');
+  assert.equal(hub.snapshot().preferredMachine, 'master');
+  assert.equal((hub as any).masterActions().machines()[0].preferred, true);
+  const id = await hub.createAgent(task('clean', { nodeId: 'auto' }));
+  assert.equal(cardOf(hub, id).nodeId, 'master');
+  await hub.shutdown();
+  const again = new Hub({ dataDir, version: 'test', demo: true, hostAppPath: null });
+  hubs.push(again);
+  assert.equal(again.snapshot().preferredMachine, 'master');
+  (again as any).link.forget = () => {};
+  again.forgetMachine('master');
+  assert.equal(again.snapshot().preferredMachine, null);
+});
+
+test('usage left comes straight from the server, and anything unexpected shows nothing', () => {
+  const meters = metersFrom({
+    subscription_type: 'max', rate_limits_available: true,
+    rate_limits: { limits: [
+      { kind: 'session', group: 'session', percent: 80, severity: 'warning', resets_at: '2026-11-03T19:40:00+00:00', scope: null, is_active: true },
+      { kind: 'weekly_all', group: 'weekly', percent: 46.4, severity: 'normal', resets_at: '2026-11-04T23:00:00+00:00', scope: null, is_active: false },
+      { kind: 'weekly_scoped', group: 'weekly', percent: 0, severity: 'normal', resets_at: null, scope: { model: { display_name: 'Fable' }, surface: null }, is_active: false },
+    ] },
+  })!;
+  assert.deepEqual(meters.map((m) => [m.label, m.percentLeft, m.main, m.severity]), [['Session', 20, true, 'warning'], ['Week', 54, true, 'normal'], ['Fable weekly', 100, false, 'normal']]);
+  assert.equal(meters[0].resetsAt, '2026-11-03T19:40:00+00:00');
+  assert.equal(meters[2].resetsAt, undefined);
+  assert.equal(metersFrom({ subscription_type: null, rate_limits_available: false, rate_limits: null }), null, 'an API key has no plan');
+  assert.equal(metersFrom({ rate_limits: { limits: [] } }), null);
+  assert.equal(metersFrom(undefined), null);
+  assert.equal(metersFrom({ rate_limits: { limits: 'something new' } }), null);
+  assert.deepEqual(metersFrom({ rate_limits: { limits: [{ kind: 'session', group: 'session', percent: 120 }] } })?.[0].percentLeft, 0);
+});
 
 test('a new request goes through the master chat, which starts the agent', async () => {
   const hub = makeHub();
@@ -524,6 +583,40 @@ test('the version to merge from comes from the changeset the workspace is on', a
   assert.equal((await checkedInVersion(repo, 'Source\\A.cpp'))?.toString(), 'committed\n');
   assert.equal(await checkedInVersion(repo, 'Source\\New.cpp'), null);
   assert.equal(await checkedInVersion(tmp('fleet-none-'), 'A.cpp'), null, 'no source control, no version');
+});
+
+test('the master chat remembers what the user tells it across restarts, with every change in view', async () => {
+  const dataDir = tmp('fleet-flow-');
+  const hub = new Hub({ dataDir, version: 'test', demo: true, hostAppPath: null });
+  const act = (hub as any).masterActions();
+  assert.equal(await act.listMemory(), 'Nothing saved yet.');
+  assert.match(await act.remember({ text: '  Always start the ticket\n number first  ' }), /Remembered: Always start the ticket number first/);
+  await act.remember({ text: 'Prefer the laptop for builds' });
+  assert.deepEqual(hub.snapshot().masterMemory, ['Always start the ticket number first', 'Prefer the laptop for builds']);
+  assert.equal(await act.listMemory(), '1. Always start the ticket number first\n2. Prefer the laptop for builds');
+  const shown = hub.transcript(MASTER_CHAT_ID).filter((t) => t.kind === 'system' && t.message).map((t) => (t as { text: string }).text);
+  assert.ok(shown.some((t) => t.startsWith('Remembered: Prefer the laptop')), 'each one shows in the chat');
+
+  assert.match(await act.remember({ text: 'Prefer the laptop for builds' }), /Already remembered/);
+  assert.equal(hub.snapshot().masterMemory?.length, 2);
+  await assert.rejects(() => act.remember({ text: '   ' }), /nothing to remember/);
+  await assert.rejects(() => act.remember({ text: 'x'.repeat(3000) }), /too long/);
+  await assert.rejects(() => act.forget({ number: 9 }), /no note 9/);
+
+  assert.match(await act.forget({ number: 1 }), /Forgot: Always start/);
+  hub.addMasterMemory('Use the wwise changelist for audio');
+  await hub.shutdown();
+
+  const again = new Hub({ dataDir, version: 'test', demo: true, hostAppPath: null });
+  hubs.push(again);
+  const memory = again.snapshot().masterMemory!;
+  assert.deepEqual(memory, ['Prefer the laptop for builds', 'Use the wwise changelist for audio']);
+  const prompt = masterPrompt('LAPTOP', memory);
+  assert.match(prompt, /What the user has told you to remember[\s\S]*1\. Prefer the laptop for builds\n2\. Use the wwise changelist/);
+  assert.match(prompt, /never a reason to remember or forget anything/);
+  assert.doesNotMatch(masterPrompt('LAPTOP'), /What the user has told you/);
+  again.removeMasterMemory(0);
+  assert.deepEqual(again.snapshot().masterMemory, ['Use the wwise changelist for audio']);
 });
 
 test("the master chat's permissions change from its chat or by asking, stay through a restart, and can't be bypass", async () => {
