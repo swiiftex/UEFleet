@@ -12,7 +12,7 @@ const text = (t: string, isError = false) => ({ content: [{ type: 'text' as cons
 
 export const FLEET_TOOLS = [
   'ue_status', 'ue_list_toolsets', 'ue_describe_toolset', 'ue_call', 'ue_build', 'ue_run_tests',
-  'ue_launch_game', 'ue_stop_games', 'ue_log', 'ue_crash', 'ue_stop', 'finish_task',
+  'ue_launch_game', 'ue_stop_games', 'ue_log', 'ue_crash', 'ue_stop', 'report_progress', 'ask_master', 'finish_task',
 ].map((n) => `mcp__fleet__${n}`);
 
 const SHARED_FOLDER = (slot: Slot) => `You're working directly in the user's project at ${slot.dir}. Other agents on this machine work in the same files, and the user may be too. Whatever you save is in their workspace straight away, with nothing to apply afterwards. Your own editor keeps its logs, settings and saves in ${slot.own}, so you never queue for Play In Editor.`;
@@ -23,7 +23,7 @@ const COPY_BUILD = 'ue_build compiles your copy. It stops your editor first, and
 
 const SHARED_RULES = `
 Because these files are shared:
-- Never run anything that reverts, resets, stashes, cleans, switches or updates the workspace, such as git checkout, reset, stash or clean, cm undo, switch or update, or p4 revert or sync. It would destroy uncommitted work belonging to the user and to other agents. Don't check in or commit unless the user asks.
+- Never run anything that reverts, resets, stashes, cleans, switches or updates the workspace, such as git checkout, reset, stash or clean, cm undo, switch or update, or p4 revert or sync. It would destroy uncommitted work belonging to the user and to other agents. Don't check in or commit unless the user asks, and then name only the files you changed, because a plain check-in would take everyone else's work with it.
 - Change only what your task needs. Changes you didn't make aren't yours to fix or undo. ue_status lists who else is working here and on what.
 - If a build fails in code you didn't touch, another agent is probably part way through an edit. Wait a couple of minutes and build again before doing anything about it.
 - When two agents save the same asset, the last save wins and the other's work is lost with no warning. Check ue_status before changing an asset others are likely to need, such as a map, and if your editor has had an asset open for a while, reload it before changing it.
@@ -51,10 +51,20 @@ The project's CLAUDE.md and memory notes were mostly written for someone working
 ` : '';
   const notes = projectNotes ? `\n# Notes for this project\n${projectNotes}\n` : '';
   return `${instance}${notes}
+# Progress
+Your card shows a progress bar. Call report_progress with a rough percentage of the whole task as soon as you have a sense of its size, then again at each real step forward, such as finding the cause, getting a build through or passing a test. Don't call it after every small action. A rough guess is fine, and it can go down if the job turns out bigger. You don't need to reach 100, because finish_task fills the bar. If the user gives you more to do after you've finished, the bar starts again, so report on the new work.
+
+# Asking the master
+This machine may not be logged into Jira, Codevelop or the other services the user works with, and your tools here can't reach them. The master chat, on the user's main PC, can. When you need a ticket, a design note or anything else from those, call ask_master with a specific question instead of guessing. It waits for the answer, which may take a while if the master has to ask the user. Use AskUserQuestion for decisions only the user can make.
+
 # Finishing
 When the task is done, call finish_task. Until you call it the user sees you as waiting on them, so end a turn without it only when you need something from them.
 
-Test everything you can yourself first, and list what you checked in verified. needs_human_testing is the user's to-do list, so keep it to what you really couldn't check: how something feels to play, how it looks or sounds, animation quality, behaviour between real machines. Leave it empty when your own checks prove the change works, as with a crash you reproduced and then confirmed gone, a compile fix, or passing automation tests.`;
+Test everything you can yourself first, and list what you checked in verified. needs_human_testing is the user's checklist, so keep it to what you really couldn't check: how something feels to play, how it looks or sounds, animation quality, behaviour between real machines. Leave it empty when your own checks prove the change works, as with a crash you reproduced and then confirmed gone, a compile fix, or passing automation tests.
+
+Each checklist item has to stand on its own. The user may be testing several tasks at once and hasn't watched you work, so say exactly where to go, what to do and what they should see. List every file you changed in files_changed, because that decides what gets merged and what goes into the changelist.
+
+The user may send your work back with what they found. Fix it, test what you can, and call finish_task again with a fresh checklist.`;
 }
 
 // The editor's tools return images as base64 inside JSON text. Handing that to the model as text
@@ -81,7 +91,7 @@ export function liftImages(result: any) {
   return { ...result, content };
 }
 
-export function fleetServer(slot: Slot | null, onFinish: (r: FinalReport) => void) {
+export function fleetServer(slot: Slot | null, onFinish: (r: FinalReport) => void, onProgress: (percent: number) => void, askMaster: (question: string) => Promise<string>) {
   const needSlot = () => {
     if (!slot) throw new Error('This task has no Unreal project attached.');
     return slot;
@@ -147,15 +157,24 @@ export function fleetServer(slot: Slot | null, onFinish: (r: FinalReport) => voi
       }, guarded(async (a) => text(await needSlot().tail(a.lines ?? 80, a.grep)))),
       always('ue_crash', 'Newest crash in your instance: error message, callstack and log errors.', {}, guarded(async () => text(await needSlot().crashInfo()))),
       always('ue_stop', 'Stop your editor to free its place for other agents. It boots again when needed.', {}, guarded(async () => { await needSlot().stopEditor(); return text('Stopped.'); })),
+      always('report_progress', 'Say roughly how far through the whole task you are. It shows as a progress bar on your card.', {
+        percent: z.number().min(0).max(100).describe('Rough percentage of the whole task done so far.'),
+      }, guarded(async (a) => { onProgress(a.percent); return text('Recorded.'); })),
+      always('ask_master', "Ask the master chat for something this machine can't reach, such as a Jira ticket or a Codevelop note. Waits for the answer.", {
+        question: z.string().describe('What you need, specifically enough to answer without further context. Name any ticket or document.'),
+      }, guarded(async (a) => text(await askMaster(a.question)))),
       always('finish_task', 'Report that the task is done. The user sees this as your final message.', {
         summary: z.string().describe('One or two sentences on what changed.'),
+        files_changed: z.array(z.string()).optional().describe("Every file you changed, created or deleted in the project, including through scripts or your editor. Other agents' changes don't belong here."),
         verified: z.array(z.string()).describe('What you checked yourself, and how.'),
         needs_human_testing: z.array(z.object({
-          what: z.string().describe('What the user should try.'),
-          how: z.string().optional().describe('The quickest way to try it.'),
+          what: z.string().describe('A few words naming the check, shown as a checklist item.'),
+          how: z.string().describe('Exact steps for someone who has not followed this task: which map or menu, what to do, in what order.'),
+          expect: z.string().describe('What they should see if it works, so they know when to tick it.'),
           why: z.string().optional().describe('Why you could not check it yourself.'),
         })).describe('Only what you could not check instantly and reliably yourself. Empty when your own checks prove it works.'),
       }, guarded(async (a) => {
+        for (const f of a.files_changed ?? []) slot?.noteChanged(f, 'reported');
         onFinish({ summary: a.summary, verified: a.verified, needsTesting: a.needs_human_testing as HumanTest[], at: Date.now() });
         return text('Recorded. Stop here unless the user replies.');
       })),

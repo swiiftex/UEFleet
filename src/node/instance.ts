@@ -7,9 +7,9 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import type { EngineInfo, InstanceMode, ProjectInfo, SlotInfo, SlotState } from '../shared/protocol';
+import type { ChangedFile, EngineInfo, InstanceMode, ProjectInfo, SlotInfo, SlotState } from '../shared/protocol';
 import { forgetCopiesFromRecents, readProjectSettings } from './machine';
-import { freeLoadedModules, seedAssetCache, seedSaves, syncProject, type SyncProgress } from './projectSync';
+import { freeLoadedModules, isBinaryPath, seedAssetCache, seedSaves, syncProject, type SyncProgress } from './projectSync';
 
 const q = (s: string) => `"${s}"`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -21,6 +21,8 @@ const BOOT_TIMEOUT_MS = 20 * 60_000;
 const BUILD_WAITS_FOR_BOOTS_MS = 2 * 60_000;
 const WAITING_FOR_BUILD = "Waiting for another agent's build";
 const OWNER_FILE = 'owner';
+const TOUCHED_FILE = 'touched.json';
+const SAVE_LINE = /LogSavePackage: Moving '[^']*' to '([^']+)'/g;
 const safeProjectName = (name: string) => name.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 16) || 'project';
 
 // Agents sharing a project folder share its build outputs too, so they compile one at a time and
@@ -104,8 +106,12 @@ export class Slot {
   private games: ChildProcess[] = [];
   private idleTimer: NodeJS.Timeout | null = null;
   private bootedAt = 0;
+  // Which files this agent changed: what its tools edited, what its editor saved, and what it says
+  // it changed. A shared folder can't tell one agent's work from another's otherwise.
+  private touched = new Map<string, 'edited' | 'reported'>();
   lastCrash: string | null = null;
   task?: string;
+  forPerson = false; // only here to build and open an editor for someone testing, so not listed
 
   constructor(
     public id: string,
@@ -118,11 +124,13 @@ export class Slot {
     public own: string = dir,
   ) {
     this.mcp = new McpClient(`http://127.0.0.1:${this.port}/mcp`);
+    try { this.touched = new Map(JSON.parse(fs.readFileSync(this.touchedFile, 'utf8'))); } catch { /* nothing yet */ }
   }
 
   get shared() { return this.own !== this.dir; }
   get port() { return this.mgr.basePort + this.index; }
-  get piePort() { return 17800 + this.index * 10; }
+  get piePort() { return this.mgr.basePiePort + this.index * 10; }
+  private get touchedFile() { return path.join(this.fleetDir, TOUCHED_FILE); }
   get projectFile() { return path.join(this.dir, path.basename(this.project.file)); }
   get fleetDir() { return path.join(this.own, '.fleet'); }
   get logFile() { return path.join(this.fleetDir, 'editor.log'); }
@@ -148,6 +156,40 @@ export class Slot {
       otherAgentsHere: this.mgr.sharingWith(this).map((s) => ({ task: s.task, editor: s.state })),
       newerBuildThanYourEditor: this.isRunning && this.gate.builtAt > this.bootedAt,
     };
+  }
+
+  noteChanged(file: string, how: 'edited' | 'reported' = 'edited') {
+    const rel = path.relative(this.dir, path.resolve(this.dir, file));
+    if (rel.startsWith('..') || path.isAbsolute(rel) || this.touched.get(rel) === 'reported') return;
+    if (this.touched.get(rel) === how) return;
+    this.touched.set(rel, how);
+    try { fs.writeFileSync(this.touchedFile, JSON.stringify([...this.touched])); } catch { /* it still has the list in memory */ }
+  }
+
+  // The editor logs every real save, and its autosaves land in its own folder, so they don't match.
+  private async collectSaves() {
+    if (!this.engine) return;
+    const log = await fsp.readFile(this.logFile, 'utf8').catch(() => '');
+    const from = path.join(this.engine.root, 'Engine/Binaries/Win64');
+    for (const m of log.matchAll(SAVE_LINE)) this.noteChanged(path.resolve(from, m[1]));
+  }
+
+  // Quick, because it only looks at the files this agent is known to have touched. A file its tools
+  // aimed at but never changed is left out, and only one it reported itself can count as deleted,
+  // because a failed edit of a file that isn't here must never delete that file somewhere else.
+  async myChanges(): Promise<ChangedFile[]> {
+    await this.collectSaves();
+    const since = this.startedAt();
+    const out: ChangedFile[] = [];
+    for (const [rel, how] of this.touched) {
+      const st = await fsp.stat(path.join(this.dir, rel)).catch(() => null);
+      if (!st) {
+        if (how === 'reported') out.push({ path: rel, kind: 'deleted', binary: isBinaryPath(rel), mine: true });
+      } else if (st.mtimeMs >= since) {
+        out.push({ path: rel, kind: st.birthtimeMs >= since ? 'added' : 'modified', binary: isBinaryPath(rel), size: st.size, mine: true });
+      }
+    }
+    return out.sort((a, b) => a.path.localeCompare(b.path));
   }
 
   // Waits out a build of this folder, then puts the state back for whatever comes next.
@@ -228,6 +270,7 @@ export class Slot {
     await this.buildsDone();
     this.setState('booting', 'Starting editor');
     await fsp.mkdir(this.fleetDir, { recursive: true });
+    await this.collectSaves();
     await fsp.rm(this.logFile, { force: true });
     const exe = path.join(this.engine!.root, 'Engine/Binaries/Win64/UnrealEditor.exe');
     const p = spawn(exe, this.editorArgs(this.mode), { argv0: q(exe), windowsVerbatimArguments: true, stdio: 'ignore', windowsHide: this.mode !== 'windowed' });
@@ -379,6 +422,26 @@ export class Slot {
     for (const g of this.games.splice(0)) killTree(g.pid);
   }
 
+  // A real editor for a person to test in, using their own settings, so it stays connected to source
+  // control. Live Coding stays off, or Unreal would refuse every agent's build while this is open.
+  // It isn't tied to this process, so restarting the app or the host leaves it open.
+  personEditorArgs() {
+    const settings = readProjectSettings(this.project.dir);
+    return [q(this.projectFile), ...(settings.startupMap ? [settings.startupMap] : []), '-NoLiveCoding', ...(settings.editorArgs ? [settings.editorArgs] : [])];
+  }
+
+  async openForPerson(): Promise<{ pid?: number; alreadyOpen: boolean }> {
+    if (!this.engine) throw new Error(`No matching Unreal Engine on this machine for ${this.project.name}.`);
+    await this.buildsDone();
+    const open = personEditors(await unrealProcesses(), this.projectFile);
+    if (open.length) return { pid: open[0], alreadyOpen: true };
+    const exe = path.join(this.engine.root, 'Engine/Binaries/Win64/UnrealEditor.exe');
+    const p = spawn(exe, this.personEditorArgs(), { argv0: q(exe), windowsVerbatimArguments: true, stdio: 'ignore', detached: true });
+    p.on('error', () => {});
+    p.unref();
+    return { pid: p.pid, alreadyOpen: false };
+  }
+
   async crashInfo(): Promise<string> {
     const dir = path.join(this.own, 'Saved', 'Crashes');
     let newest: string | null = null;
@@ -399,6 +462,24 @@ export class Slot {
 export function killTree(pid?: number) {
   if (!pid) return;
   spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+}
+
+// Agents' editors all carry -UserDir, so an editor on this project without it is a person's.
+export function personEditors(processes: { pid: number; commandLine: string }[], projectFile: string): number[] {
+  const norm = (s: string) => s.replaceAll('\\', '/').toLowerCase();
+  const file = norm(projectFile);
+  return processes.filter((p) => norm(p.commandLine).includes(file) && !/-UserDir=/i.test(p.commandLine)).map((p) => p.pid);
+}
+
+function unrealProcesses(): Promise<{ pid: number; commandLine: string }[]> {
+  return new Promise((resolve) => {
+    const script = "Get-CimInstance Win32_Process -Filter \"Name='UnrealEditor.exe'\" | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }";
+    const p = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    p.stdout!.on('data', (d) => { out += d; });
+    p.on('error', () => resolve([]));
+    p.on('exit', () => resolve(out.split(/\r?\n/).filter(Boolean).map((l) => { const [pid, ...rest] = l.split('\t'); return { pid: Number(pid), commandLine: rest.join('\t') }; })));
+  });
 }
 
 function runCaptured(exe: string, args: string[], cwd: string): Promise<{ code: number; text: string }> {
@@ -426,7 +507,9 @@ export function summarizeBuild(text: string): string {
 export class SlotManager extends EventEmitter {
   editors: Semaphore;
   builds: Semaphore;
-  basePort = 8300;
+  // Moved aside for tests, so they can run on a PC that's also running real agents.
+  basePort = Number(process.env.FLEET_BASE_PORT) || 8300;
+  basePiePort = Number(process.env.FLEET_BASE_PIE_PORT) || 17800;
   idleStopMs = 10 * 60_000;
   private slots = new Map<string, Slot>();
   private gates = new Map<string, BuildGate>();
@@ -439,7 +522,7 @@ export class SlotManager extends EventEmitter {
   }
 
   setMaxInstances(n: number) { this.editors.limit = n; }
-  list(): SlotInfo[] { return [...this.slots.values()].map((s) => s.info()); }
+  list(): SlotInfo[] { return [...this.slots.values()].filter((s) => !s.forPerson).map((s) => s.info()); }
   changed(_s: Slot) { this.emit('changed'); }
 
   gate(projectDir: string) {
@@ -506,6 +589,7 @@ export class SlotManager extends EventEmitter {
     }
     await fsp.mkdir(path.join(dir, '.fleet'), { recursive: true });
     await fsp.writeFile(path.join(dir, '.fleet', OWNER_FILE), agentId);
+    await fsp.rm(path.join(dir, '.fleet', TOUCHED_FILE), { force: true });
     const slot = new Slot(`${safeName}-${path.basename(dir)}`, index, project, shared ? project.dir : dir, engine, this, dir);
     slot.agentId = agentId;
     slot.mode = mode;

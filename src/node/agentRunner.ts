@@ -29,6 +29,11 @@ export interface RunnerConfig {
   appendPrompt: string;
   memoryDir?: string | null;
   emit: (ev: AgentEvent) => void;
+  // The master chat keeps the user's own MCP servers. Agents must only ever reach their own editor.
+  userMcp?: boolean;
+  additionalDirectories?: string[];
+  disallowedTools?: string[];
+  onFileEdited?: (file: string) => void;
 }
 
 type Pending = { resolve: (r: PermissionResult) => void; input: Record<string, unknown>; suggestions?: PermissionUpdate[] };
@@ -85,7 +90,7 @@ export class AgentRunner {
     void this.loop();
   }
 
-  send(text: string, images?: ImageAttachment[], broadcastId?: string) {
+  send(text: string, images?: ImageAttachment[], broadcastId?: string, from?: string) {
     const content: any[] = [];
     const shown: string[] = [];
     for (const img of images ?? []) {
@@ -93,7 +98,7 @@ export class AgentRunner {
       shown.push(`data:${img.mediaType};base64,${img.data}`);
     }
     content.push({ type: 'text', text });
-    this.emit({ k: 'item', item: { kind: 'user', id: this.id('u'), at: Date.now(), text, images: shown.length ? shown : undefined, broadcastId } });
+    this.emit({ k: 'item', item: { kind: 'user', id: this.id('u'), at: Date.now(), text, images: shown.length ? shown : undefined, broadcastId, from } });
     this.emit({ k: 'attention-clear' });
     this.emit({ k: 'activity', status: 'working', bucket: 'thinking' });
     this.input.push({ type: 'user', message: { role: 'user', content }, parent_tool_use_id: null } as SDKUserMessage);
@@ -119,9 +124,10 @@ export class AgentRunner {
           includePartialMessages: true,
           resume: this.sessionId,
           mcpServers,
-          // Agents must only ever reach their own editor, never one from the user's config.
-          strictMcpConfig: true,
+          strictMcpConfig: !this.cfg.userMcp,
           allowedTools,
+          additionalDirectories: this.cfg.additionalDirectories,
+          disallowedTools: this.cfg.disallowedTools,
           systemPrompt: { type: 'preset', preset: 'claude_code', append: appendPrompt },
           settingSources: ['user', 'project', 'local'],
           settings: this.cfg.memoryDir ? { autoMemoryDirectory: this.cfg.memoryDir } : undefined,
@@ -222,6 +228,8 @@ export class AgentRunner {
       } else if (block.type === 'tool_use') {
         this.tools.set(block.id, { at: Date.now(), name: block.name, input: block.input, sub });
         this.emit({ k: 'item', item: { kind: 'tool', id: block.id, at: Date.now(), name: block.name, input: block.input, state: 'running', sub } });
+        const edited = CODING_TOOLS.test(block.name) ? block.input?.file_path ?? block.input?.notebook_path : undefined;
+        if (typeof edited === 'string') this.cfg.onFileEdited?.(edited);
         if (!sub) {
           const c = classifyTool(block.name, block.input);
           this.emit({ k: 'activity', status: c.status, bucket: c.bucket, detail: block.name });

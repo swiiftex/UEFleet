@@ -20,7 +20,26 @@ export interface Attention {
 export interface HumanTest {
   what: string;
   how?: string;
+  expect?: string;
   why?: string;
+}
+
+// Every task moves through these in order. Anything needing the user pauses it where it is.
+export type FlowStage = 'preparing' | 'building' | 'testing' | 'awaiting-merge' | 'merged' | 'checking-in' | 'complete';
+export const FLOW_STAGES: { id: FlowStage; label: string }[] = [
+  { id: 'preparing', label: 'Preparing' },
+  { id: 'building', label: 'Building' },
+  { id: 'testing', label: 'Testing' },
+  { id: 'awaiting-merge', label: 'Awaiting merge' },
+  { id: 'merged', label: 'Merged' },
+  { id: 'checking-in', label: 'Checking in' },
+  { id: 'complete', label: 'Complete' },
+];
+
+export interface MergeState {
+  files: number;
+  conflicts?: { path: string; reason: string }[];
+  error?: string;
 }
 
 export interface FinalReport {
@@ -39,13 +58,13 @@ export interface Question {
 }
 
 export type TranscriptItem =
-  | { kind: 'user'; id: string; at: number; text: string; images?: string[]; broadcastId?: string }
+  | { kind: 'user'; id: string; at: number; text: string; images?: string[]; broadcastId?: string; from?: string } // from: set when it came from something other than the user
   | { kind: 'assistant'; id: string; at: number; text: string; streaming?: boolean; sub?: boolean }
   | { kind: 'thinking'; id: string; at: number; text: string; streaming?: boolean }
   | { kind: 'tool'; id: string; at: number; name: string; input: unknown; state: 'running' | 'done' | 'error'; result?: string; images?: string[]; ms?: number; sub?: boolean }
   | { kind: 'permission'; id: string; at: number; tool: string; input: unknown; canAlways: boolean; reason?: string; decided?: 'allow' | 'always' | 'deny' }
   | { kind: 'question'; id: string; at: number; questions: Question[]; answers?: Record<string, string> }
-  | { kind: 'system'; id: string; at: number; text: string; tone?: 'info' | 'warn' | 'error' }
+  | { kind: 'system'; id: string; at: number; text: string; tone?: 'info' | 'warn' | 'error'; message?: boolean } // message: what the agent said in closing, rather than a note about it
   | { kind: 'final'; id: string; at: number; report: FinalReport };
 
 export interface UsageSnapshot {
@@ -65,6 +84,8 @@ export type AgentEvent =
   | { k: 'activity'; status: AgentStatus; bucket?: ActivityBucket | null; detail?: string }
   | { k: 'usage'; usage: Partial<UsageSnapshot> }
   | { k: 'tokens'; n: number }
+  | { k: 'progress'; percent: number }
+  | { k: 'ask-master'; id: string; question: string }
   | { k: 'attention'; kind: AttentionKind; text: string; ref?: string }
   | { k: 'attention-clear'; ref?: string }
   | { k: 'final'; report: FinalReport }
@@ -124,6 +145,8 @@ export interface NodeInfo {
   projects: ProjectInfo[];
   claudePath: string | null;
   version: string;
+  build?: string; // a hash of the running host, so the master can tell when it's out of date
+  selfUpdate?: boolean; // false when it isn't running from its own exe, as in development
 }
 
 export interface NodeStats {
@@ -155,7 +178,7 @@ export interface ProjectRef {
 export interface ImageAttachment { mediaType: string; data: string }
 
 export type ChangeKind = 'modified' | 'added' | 'deleted';
-export interface ChangedFile { path: string; kind: ChangeKind; binary: boolean; size?: number; usuallySkipped?: boolean }
+export interface ChangedFile { path: string; kind: ChangeKind; binary: boolean; size?: number; usuallySkipped?: boolean; mine?: boolean } // mine: this agent changed it, in a shared folder
 export interface ApplyResult {
   applied: string[];
   merged: string[];
@@ -210,8 +233,20 @@ export interface AgentCard {
   buckets: Record<ActivityBucket, number>;
   slot: SlotInfo | null;
   final: FinalReport | null;
+  progress?: number; // the agent's own rough estimate, until it finishes
   sessionId?: string;
   archived?: boolean;
+  isMaster?: boolean; // the master chat, which routes requests rather than doing a task itself
+  stage?: FlowStage;
+  testRun?: TestRun;
+  merge?: MergeState;
+  changelist?: string;
+}
+
+// Where the one-button test has got to.
+export interface TestRun {
+  stage: 'pulling' | 'building' | 'opening' | 'open' | 'already-open' | 'failed';
+  detail?: string;
 }
 
 export interface BroadcastReply { agentId: string; text: string; at: number }
@@ -229,7 +264,24 @@ export interface MachineView {
   stats: NodeStats | null;
   slots: SlotInfo[];
   lastSeen: number;
+  update?: HostUpdate;
 }
+
+// A new host on its way to a machine. It restarts once no agent there is busy, or when told to.
+export interface HostUpdate {
+  stage: 'sending' | 'waiting' | 'restarting' | 'failed';
+  percent?: number;
+  busy?: number;
+  detail?: string;
+}
+
+// A newer version of the app, ready to load. Agents and editors keep running through a restart.
+export interface AppUpdate {
+  id: string;
+  needsRestart: boolean;
+}
+
+export const MASTER_CHAT_ID = 'master-chat';
 
 export interface FleetSnapshot {
   cards: AgentCard[];
@@ -240,6 +292,7 @@ export interface FleetSnapshot {
   defaults: NewTaskDefaults;
   hostAppPath: string | null;
   demo: boolean;
+  appUpdate?: AppUpdate | null;
 }
 
 export interface NewTaskDefaults {
@@ -269,7 +322,9 @@ export type HubEvent =
   | { e: 'broadcasts'; broadcasts: Broadcast[] }
   | { e: 'tests'; testList: FleetSnapshot['testList'] }
   | { e: 'transcript'; agentId: string; items: TranscriptItem[]; deltas: { id: string; text: string }[] }
-  | { e: 'all-done'; count: number };
+  | { e: 'all-done'; count: number }
+  | { e: 'task-started'; id: string }
+  | { e: 'app-update'; update: AppUpdate | null };
 
 export const MODELS = [
   { id: 'claude-opus-5-5', label: 'Opus 5.5' },

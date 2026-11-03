@@ -2,7 +2,7 @@
   "name": "ue-fleet",
   "version": "1.0.0",
   "description": "Run many Claude agents on Unreal Engine at once, each with its own editor.",
-  "main": "dist/main.cjs",
+  "main": "dist/loader.cjs",
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
@@ -10,7 +10,9 @@
     "demo": "node scripts/build.mjs && node scripts/demo.mjs",
     "test": "node scripts/build.mjs && node scripts/test.mjs",
     "test:ui": "node scripts/build.mjs && node test/ui.e2e.mjs",
-    "package": "node scripts/package.mjs"
+    "package": "node scripts/package.mjs",
+    "deploy": "node scripts/deploy.mjs",
+    "deploy:watch": "node scripts/deploy.mjs --watch"
   },
   "keywords": [],
   "author": "",

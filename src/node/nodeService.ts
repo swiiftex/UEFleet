@@ -21,6 +21,11 @@ interface Live {
 }
 
 const REPLAY_LIMIT = 20_000;
+// Long enough for the master to ask the user, who may be away.
+const MASTER_ANSWER_TIMEOUT_MS = 45 * 60_000;
+
+// What identifies a card's folder when no agent is running there, after a restart or a Stop.
+interface AgentFolder { agentId: string; slotDir?: string; projectFile?: string }
 
 export class NodeService extends EventEmitter {
   info: NodeInfo;
@@ -29,6 +34,8 @@ export class NodeService extends EventEmitter {
   private stats = statsSampler();
   private timers: NodeJS.Timeout[] = [];
   private slotDirty = false;
+  private questions = new Map<string, (answer: string) => void>();
+  private nextQuestion = 1;
 
   constructor(private opts: { id: string; role: NodeInfo['role']; version: string; dataDir: string; pinnedProjects?: () => string[]; extraEngines?: string[] }) {
     super();
@@ -115,7 +122,7 @@ export class NodeService extends EventEmitter {
     const emit = (ev: AgentEvent) => this.emitAgent(spawn.id, ev);
 
     if (spawn.demo) {
-      live.runner = new DemoRunner(spawn, emit);
+      live.runner = new DemoRunner(spawn, emit, (q) => this.askMaster(spawn.id, q));
       live.runner.start({ text: spawn.prompt, images: spawn.images });
       return { ok: true };
     }
@@ -144,7 +151,7 @@ export class NodeService extends EventEmitter {
     const server = fleetServer(live.slot, (report) => {
       emit({ k: 'final', report });
       void live.slot?.stopEditor();
-    });
+    }, (percent) => emit({ k: 'progress', percent }), (q) => this.askMaster(spawn.id, q));
     const settings = project ? readProjectSettings(project.dir) : {};
     live.runner = new AgentRunner({
       spawn,
@@ -157,6 +164,7 @@ export class NodeService extends EventEmitter {
       appendPrompt: appendPrompt(live.slot, settings.agentNotes),
       memoryDir: project ? projectMemoryDir(project.dir) : null,
       emit,
+      onFileEdited: (f) => live.slot?.noteChanged(f),
     });
     (live.runner as AgentRunner).start(spawn.startPrompt === false ? undefined : { text: spawn.prompt, images: spawn.images });
     return { ok: true, cwd };
@@ -187,30 +195,90 @@ export class NodeService extends EventEmitter {
     void this.slots.removeUnusedCopies(this.info.projects);
   }
 
-  async changes(agentId: string): Promise<ChangedFile[]> {
-    const a = this.need(agentId);
-    if (!a.slot) return [];
-    const never = readProjectSettings(a.slot.project.dir).neverApply ?? [];
+  // A finished card's files are still there after a restart, with no agent running, so its folder
+  // can be picked back up without one.
+  private folderOf({ agentId, slotDir, projectFile }: AgentFolder): Slot | null {
+    const live = this.agents.get(agentId)?.slot ?? this.slots.get(agentId);
+    if (live) return live;
+    if (!slotDir || !projectFile || !fs.existsSync(slotDir)) return null;
+    const project = this.info.projects.find((p) => p.file.toLowerCase() === projectFile.toLowerCase()) ?? readProject(projectFile, this.info.engines);
+    return project ? this.slots.adopt(project, resolveEngine(project, this.info.engines), agentId, slotDir, 'headless') : null;
+  }
+
+  // In a shared folder this is the agent's own work, which is quick to find. Everything that changed
+  // there, whoever by, means scanning the whole project.
+  async changes(where: AgentFolder, all = false): Promise<ChangedFile[]> {
+    const slot = this.folderOf(where);
+    if (!slot) return [];
+    const never = readProjectSettings(slot.project.dir).neverApply ?? [];
     const norm = (p: string) => p.replaceAll('\\', '/').toLowerCase();
-    const list = a.slot.shared ? await changedSince(a.slot.dir, a.slot.startedAt()) : await listChanges(a.slot.dir);
+    let list: ChangedFile[];
+    if (!slot.shared) list = await listChanges(slot.dir);
+    else if (!all) list = await slot.myChanges();
+    else {
+      const mine = new Set((await slot.myChanges()).map((c) => c.path));
+      list = (await changedSince(slot.dir, slot.startedAt())).map((c) => ({ ...c, mine: mine.has(c.path) }));
+    }
     return list.map((c) => ({ ...c, usuallySkipped: never.some((n) => norm(c.path) === norm(n)) }));
   }
-  async apply(agentId: string, only?: string[], force?: string[]): Promise<ApplyResult> {
-    const a = this.need(agentId);
+  async apply(where: AgentFolder, only?: string[], force?: string[]): Promise<ApplyResult> {
+    const slot = this.folderOf(where);
     // Work in a shared folder is already in the project.
-    if (!a.slot || a.slot.shared) return { applied: [], merged: [], conflicts: [] };
-    return applyChanges(a.slot.dir, a.slot.project.dir, only, force);
+    if (!slot || slot.shared) return { applied: [], merged: [], conflicts: [] };
+    return applyChanges(slot.dir, slot.project.dir, only, force);
   }
-  async readAgentFile(agentId: string, rel: string, offset: number) {
-    const a = this.need(agentId);
-    if (!a.slot) throw new Error('No project on this task.');
-    return readChunk(path.join(a.slot.dir, rel), offset);
+  async readAgentFile(where: AgentFolder, rel: string, offset: number) {
+    const slot = this.folderOf(where);
+    if (!slot) throw new Error('No project on this task.');
+    return readChunk(path.join(slot.dir, rel), offset);
   }
   // Base64, because this crosses the machine link as JSON and has to arrive byte for byte.
-  async agentBaseText(agentId: string, rel: string) {
-    const a = this.need(agentId);
-    const base = a.slot && !a.slot.shared ? await baseText(a.slot.dir, rel) : null;
+  async agentBaseText(where: AgentFolder, rel: string) {
+    const slot = this.folderOf(where);
+    const base = slot && !slot.shared ? await baseText(slot.dir, rel) : null;
     return base ? base.toString('base64') : null;
+  }
+
+  // The agent waits on its tool call. The answer comes back from the master through masterReply.
+  private askMaster(agentId: string, question: string): Promise<string> {
+    const id = `q${this.nextQuestion++}-${Date.now().toString(36)}`;
+    const key = `${agentId}:${id}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.questions.delete(key);
+        resolve("The master didn't answer in time. Carry on with what you have, and say in your final message what you couldn't find out.");
+      }, MASTER_ANSWER_TIMEOUT_MS);
+      this.questions.set(key, (answer) => { clearTimeout(timer); resolve(answer); });
+      this.emitAgent(agentId, { k: 'activity', status: 'working', bucket: 'waiting', detail: 'Asking the master' });
+      this.emitAgent(agentId, { k: 'ask-master', id, question });
+    });
+  }
+  masterReply(agentId: string, id: string, answer: string) {
+    const key = `${agentId}:${id}`;
+    const resolve = this.questions.get(key);
+    if (!resolve) return false;
+    this.questions.delete(key);
+    resolve(answer);
+    return true;
+  }
+
+  // Compiles if asked, then opens a real editor window on this machine for a person to test in.
+  async openTestEditor(file: string, build: boolean): Promise<{ ok: boolean; output?: string; alreadyOpen?: boolean; pid?: number }> {
+    const project = this.info.projects.find((p) => p.file.toLowerCase() === file.toLowerCase()) ?? readProject(file, this.info.engines);
+    if (!project) throw new Error(`${file} isn't on ${this.info.name}.`);
+    const engine = resolveEngine(project, this.info.engines);
+    if (!engine) throw new Error(`No Unreal Engine ${project.engineVersion ?? ''} on ${this.info.name} for ${project.name}.`);
+    const id = `test-${project.name}`;
+    let slot = this.slots.get(id);
+    if (!slot) {
+      slot = await this.slots.acquire({ ...project, received: false }, engine, id, 'windowed');
+      slot.forPerson = true;
+    }
+    if (build) {
+      const r = await slot.build({});
+      if (!r.ok) return { ok: false, output: r.output };
+    }
+    return { ok: true, ...(await slot.openForPerson()) };
   }
   async logTail(agentId: string, lines: number) {
     const a = this.need(agentId);
@@ -262,10 +330,13 @@ export class NodeService extends EventEmitter {
       case 'agent.interrupt': return this.interrupt(p.agentId);
       case 'agent.stop': return this.stop(p.agentId, p.releaseSlot, p.slotDir);
       case 'agent.has': return this.has(p.agentId);
-      case 'agent.changes': return this.changes(p.agentId);
-      case 'agent.apply': return this.apply(p.agentId, p.only, p.force);
-      case 'agent.readFile': return this.readAgentFile(p.agentId, p.path, p.offset);
-      case 'agent.baseText': return this.agentBaseText(p.agentId, p.path);
+      case 'agent.changes': return this.changes(p, p.all);
+      case 'agent.apply': return this.apply(p, p.only, p.force);
+      case 'agent.readFile': return this.readAgentFile(p, p.path, p.offset);
+      case 'agent.baseText': return this.agentBaseText(p, p.path);
+      case 'agent.masterReply': return this.masterReply(p.agentId, p.id, p.answer);
+      case 'machine.openTestEditor': return this.openTestEditor(p.file, p.build);
+      case 'machine.addProject': return this.addProject(p.file);
       case 'agent.log': return this.logTail(p.agentId, p.lines);
       case 'agent.stopInstance': return this.stopInstance(p.agentId);
       case 'project.plan': return this.projectPlan(p.name, p.manifest);

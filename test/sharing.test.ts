@@ -267,7 +267,7 @@ test('bringing work back from a shared folder on another machine leaves a file t
   const old = new Date(Date.now() - 60_000);
   fs.utimesSync(untouched, old, old);
   const id = 'remote-card';
-  const rec = { card: { id, nodeId: 'laptop', project: 'Game', createdAt: Date.now() - 30_000, slot: { shared: true } }, sourceProjectDir: dest };
+  const rec = { card: { id, nodeId: 'laptop', project: 'Game', createdAt: Date.now() - 30_000, slot: { shared: true } }, spawn: {}, sourceProjectDir: dest };
   (hub as any).agents.set(id, rec);
   const content: Record<string, string> = { 'Untouched.cpp': 'from the laptop', 'ChangedHere.cpp': 'from the laptop' };
   (hub as any).nodeCall = async (_node: string, method: string, p: any) => {

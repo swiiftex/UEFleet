@@ -9,9 +9,12 @@ import { dataRoot, engineFromRoot, engineProblem, engineRootOf, projectFileFrom 
 import { NodeService } from '../node/nodeService';
 import { decodePairCode, type PairCode } from '../shared/pair';
 import { keepAwake } from './keepAwake';
+import { hashOf, selfExe, SelfUpdater } from './selfUpdate';
 import type { LinkFrame, NodeEvent } from '../shared/protocol';
 
 const VERSION = '1.0.0';
+// The master's own host: started by the app, with no window, and it outlives app restarts.
+const LOCAL = process.argv.includes('--local');
 const DATA = process.env.FLEET_HOST_DATA ?? dataRoot('uefleet-host');
 const CONFIG = path.join(DATA, 'config.json');
 
@@ -96,6 +99,8 @@ async function main() {
   }
   const codeArg = argValue('--pair');
   if (codeArg) { cfg.pair = decodePairCode(codeArg); delete cfg.key; }
+  if (LOCAL && !cfg.pair) throw new Error('The app starts this one, and has to set it up first.');
+  if (LOCAL) fs.writeFileSync(path.join(DATA, 'local-host.pid'), String(process.pid));
   if (!cfg.pair) {
     console.log('\nOn the master, open Machines and copy the pairing code.');
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -108,8 +113,13 @@ async function main() {
   }
   saveConfig(cfg);
 
-  const service = new NodeService({ id: cfg.hostId, role: 'remote', version: VERSION, dataDir: DATA, extraEngines: cfg.engines, pinnedProjects: () => loadConfig().projects ?? [] });
+  const service = new NodeService({ id: cfg.hostId, role: LOCAL ? 'master' : 'remote', version: VERSION, dataDir: DATA, extraEngines: cfg.engines, pinnedProjects: () => loadConfig().projects ?? [] });
   const info = service.info;
+  const exe = selfExe();
+  info.selfUpdate = !!exe;
+  info.build = await hashOf(exe ?? process.argv[1]);
+  const updater = exe ? new SelfUpdater(exe) : null;
+  void updater?.cleanUp();
   console.log(`\nThis machine: ${info.name}, ${info.threads} threads, ${info.ramGb} GB RAM, ${info.vramGb} GB VRAM`);
   console.log(`Unreal: ${info.engines.length ? '' : 'none found'}`);
   for (const e of info.engines) console.log(`  ${e.version}  ${e.root}${e.hasMcp ? '' : `\n    ${NO_MCP}`}`);
@@ -120,20 +130,47 @@ async function main() {
   for (const p of info.projects.filter((x) => !x.received).slice(0, 12)) console.log(`  ${p.name}  ${p.dir}`);
   console.log(`Up to ${info.maxInstances} editors at once.\n`);
   keepAwake(log);
-  connect(cfg, service);
+  connect(cfg, service, updater);
 
   const quit = async () => { log('Shutting down.'); await service.shutdown(); process.exit(0); };
   process.on('SIGINT', quit);
   process.on('SIGTERM', quit);
 }
 
-function connect(cfg: Config, service: NodeService) {
+// Installing a new version: the master sends the exe, then says when to switch to it.
+async function hostRpc(method: string, p: any, service: NodeService, updater: SelfUpdater | null): Promise<unknown> {
+  if (method === 'host.shutdown') {
+    if (!LOCAL) throw new Error('Only the master\'s own host shuts down on request.');
+    setTimeout(() => { void service.shutdown().finally(() => process.exit(0)); }, 50);
+    return true;
+  }
+  if (!updater) throw new Error("This host isn't running from its own exe, so it can't update itself.");
+  switch (method) {
+    case 'host.updateBegin': return updater.begin(p.hash, p.size);
+    case 'host.updateChunk': return updater.chunk(p.offset, p.data);
+    case 'host.updateFinish': return updater.finish();
+    case 'host.restart':
+      log('Restarting into the new version.');
+      setTimeout(() => {
+        void service.shutdown().catch(() => {}).finally(() => {
+          updater.swapAndStart(LOCAL ? path.join(DATA, 'local-host.log') : undefined);
+          process.exit(0);
+        });
+      }, 50);
+      return true;
+    default: throw new Error(`Unknown method ${method}`);
+  }
+}
+
+function connect(cfg: Config, service: NodeService, updater: SelfUpdater | null) {
   let backoff = 1000;
   let addrIndex = 0;
-  const schedule = () => { setTimeout(open, backoff); backoff = Math.min(backoff * 1.7, 15_000); };
+  // The master's own host is only waiting on an app restart, so it comes back quickly.
+  const schedule = () => { setTimeout(open, backoff); backoff = Math.min(backoff * 1.7, LOCAL ? 1000 : 15_000); };
 
   function open() {
-    const pair = cfg.pair!;
+    // Read fresh each time: the app rewrites this if its port had to change.
+    const pair = (LOCAL ? loadConfig().pair : undefined) ?? cfg.pair!;
     const addr = pair.a[addrIndex % Math.max(1, pair.a.length)] ?? '127.0.0.1';
     addrIndex++;
     const url = `wss://${addr}:${pair.p}`;
@@ -182,7 +219,7 @@ function connect(cfg: Config, service: NodeService) {
         void holdOpen().then(() => process.exit(1));
       } else if (f.f === 'req') {
         const { id, method, params } = f;
-        service.rpc(method, params).then(
+        (method.startsWith('host.') ? hostRpc(method, params, service, updater) : service.rpc(method, params)).then(
           (result) => ws.send(JSON.stringify({ f: 'res', id, ok: true, result } satisfies LinkFrame)),
           (e) => ws.send(JSON.stringify({ f: 'res', id, ok: false, error: String(e?.message ?? e) } satisfies LinkFrame)),
         );

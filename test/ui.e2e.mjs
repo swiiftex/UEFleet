@@ -16,7 +16,7 @@ const app = await electron.launch({
   executablePath: require('electron'),
   args: [root],
   cwd: root,
-  env: { ...process.env, FLEET_DEMO: '1', FLEET_DATA: dataDir },
+  env: { ...process.env, FLEET_DEMO: '1', FLEET_DATA: dataDir, FLEET_TEST_UNSEEN: '1' },
 });
 const page = await app.firstWindow();
 const errors = [];
@@ -91,9 +91,7 @@ await step('Tab jumps straight to the waiting chat, even while typing in the com
 await step('number keys answer the prompt, and Tab walks through the rest', async () => {
   // Whichever came first, deal with both.
   for (let i = 0; i < 2; i++) {
-    const sel = await selectedId();
-    const kind = await page.evaluate(() => (document.querySelector('[data-permission]') ? 'permission' : document.querySelector('[data-question]') ? 'question' : null));
-    assert.ok(kind, `selected chat ${sel} should be showing a prompt`);
+    const kind = await until(() => page.evaluate(() => (document.querySelector('[data-permission]') ? 'permission' : document.querySelector('[data-question]') ? 'question' : null)), 'the selected chat to show its prompt');
     await page.keyboard.press('1');
     await page.waitForSelector(kind === 'permission' ? '[data-permission]' : '[data-question]', { state: 'detached' });
     if (i === 0) {
@@ -165,21 +163,27 @@ await step('a finished task with nothing to test stays quiet', async () => {
   assert.ok(!seen.has(ids.clean), 'no popup for a self-verified task');
 });
 
-await step('a finished task with things to test gets a popup, a final message, and a test list', async () => {
+await step('a finished task with things to test gets a popup, a final message, and a checklist with instructions', async () => {
   ids.testing = await spawn('testing', 'Greenhouse sprinkler should only run at dawn');
   const p = await until(async () => { const x = await popupId(); return x === ids.testing ? x : null; }, 'the testing popup', 20000);
+  assert.match(await page.evaluate(() => document.querySelector('.popup').innerText), /Ready to test/);
   await page.screenshot({ path: path.join(shots, '05-all-cards.png') });
   await page.keyboard.press('Tab');
   await until(async () => (await selectedId()) === p, 'the jump');
-  await page.waitForSelector('.final-card');
-  await page.screenshot({ path: path.join(shots, '06-final-message.png') });
-  const text = await page.evaluate(() => document.querySelector('.final-card').innerText);
+  await page.waitForSelector('[data-checklist]');
+  await page.screenshot({ path: path.join(shots, '06-checklist.png') });
+  const text = await page.evaluate(() => document.querySelector('[data-checklist]').innerText);
   assert.ok(text.includes('Walk past the sprinkler'));
+  assert.ok(text.includes('Open Greenhouse_2 and press Play'), 'how to test it');
+  assert.ok(text.includes('You should see'), 'what to look for');
+  assert.ok(text.includes('Approve (tested)') && text.includes('Issue found'));
+  assert.match(await page.evaluate(() => document.querySelector('[data-flow-text]').innerText), /Your turn to test/);
   assert.ok((await page.evaluate(() => document.querySelector('[data-tests-btn]').innerText)).includes('2'));
+  assert.match(await page.evaluate((id) => document.querySelector(`[data-card="${id}"] .card-status`).innerText, p), /TESTING · NEEDS YOU/);
 });
 
 await step('ticking a test off updates the count', async () => {
-  await page.click('.final-tests input');
+  await page.click('.checks input');
   await until(() => page.evaluate(() => document.querySelector('[data-tests-btn]').innerText.includes('1')), 'the count to drop');
 });
 
@@ -198,7 +202,7 @@ await step('a new request that matches a card offers to send it there, and Alt+1
     const t = await page.evaluate((id) => window.fleet.call('transcript', id), offered);
     return t.some((x) => x.kind === 'user' && x.text.includes('near the pond'));
   }, 'the message to arrive');
-  const count = await page.evaluate(() => window.fleet.call('snapshot').then((s) => s.cards.length));
+  const count = await page.evaluate(() => window.fleet.call('snapshot').then((s) => s.cards.filter((c) => !c.isMaster).length));
   assert.equal(count, Object.keys(ids).length + 1, 'no new card was made');
   // It answers and goes back to waiting on the user, which would keep the fleet "busy" below.
   await until(() => page.evaluate((id) => window.fleet.call('snapshot').then((s) => !!s.cards.find((c) => c.id === id).attention), offered), 'its reply');
@@ -213,7 +217,7 @@ await step('Enter still makes a new task when the suggestion is not wanted', asy
   await page.waitForSelector('[data-route]');
   await page.keyboard.press('Enter');
   await page.waitForSelector('[data-new-task]', { state: 'detached' });
-  await until(() => page.evaluate((n) => window.fleet.call('snapshot').then((s) => s.cards.length === n), Object.keys(ids).length + 2), 'a new card');
+  await until(() => page.evaluate((n) => window.fleet.call('snapshot').then((s) => s.cards.filter((c) => !c.isMaster).length === n), Object.keys(ids).length + 2), 'a new card');
   await until(() => page.evaluate(() => window.fleet.call('snapshot').then((s) => s.cards.at(-1).status === 'finished')), 'it to finish', 20000);
 });
 
@@ -226,7 +230,7 @@ await step('Esc in the composer interrupts a running agent without a popup', asy
   assert.equal(c.attention, null);
 });
 
-await step('when everything is done, a popup offers the test list and Tab opens it', async () => {
+await step('when everything is done, a popup points at what is left to test and Tab goes there', async () => {
   await page.evaluate(async (id) => { await window.fleet.call('stopAgent', id); }, longId);
   // Anything still waiting on the user keeps the fleet "busy", so settle those first.
   for (const c of await page.evaluate(() => window.fleet.call('snapshot').then((s) => s.cards))) {
@@ -235,9 +239,8 @@ await step('when everything is done, a popup offers the test list and Tab opens 
   await until(() => page.evaluate(() => document.querySelector('[data-popup="all-done"]') != null), 'the all-done popup', 10000);
   await page.screenshot({ path: path.join(shots, '07-all-done.png') });
   await page.keyboard.press('Tab');
-  await page.waitForSelector('[data-tests]');
-  await page.screenshot({ path: path.join(shots, '08-test-list.png') });
-  await page.keyboard.press('Escape');
+  await until(async () => (await selectedId()) === ids.testing, 'the jump to the checklist');
+  await page.waitForSelector('[data-checklist]');
 });
 
 await step('the machines window shows a pairing code', async () => {
@@ -260,6 +263,143 @@ await step('Ctrl+2 jumps to the second card', async () => {
   await page.click('[data-composer]');
   await page.keyboard.press('Control+2');
   await until(async () => (await selectedId()) === ids.permission, 'selection');
+});
+
+const progress = (id) => page.evaluate((i) => {
+  const card = document.querySelector(`[data-card="${i}"]`);
+  return { text: card.querySelector('.progress-text').innerText, width: card.querySelector('.progress-fill').style.width, value: card.querySelector('[role="progressbar"]').getAttribute('aria-valuenow') };
+}, id);
+
+await step('each card shows how far through its task the agent is', async () => {
+  assert.deepEqual(await progress(ids.clean), { text: '100%', width: '100%', value: '100' }, 'finished is full');
+  const stopped = await progress(longId);
+  assert.match(stopped.text, /^\d+%$/);
+  assert.ok(Number.parseInt(stopped.text, 10) >= 50 && Number.parseInt(stopped.text, 10) < 100, `a stopped task keeps what it reported: ${stopped.text}`);
+  assert.equal(stopped.width, stopped.text, 'the bar matches the number');
+
+  const fresh = await page.evaluate(() => window.fleet.call('createAgent', { prompt: 'Sweep the greenhouse paths', projectFile: null, nodeId: 'master', model: 'claude-opus-5-5', effort: 'low', permissionMode: 'default', instanceMode: 'offscreen', demo: 'clean' }));
+  await until(() => page.evaluate((i) => !!document.querySelector(`[data-card="${i}"]`), fresh), 'the new card');
+  assert.equal((await progress(fresh)).text, '–', 'nothing reported yet');
+  await until(async () => (await progress(fresh)).text !== '–', 'its first report');
+  await page.screenshot({ path: path.join(shots, '13-progress.png') });
+  await until(async () => (await progress(fresh)).text === '100%', 'it to finish', 20000);
+
+  await page.evaluate((i) => window.fleet.call('send', i, 'One more thing'), fresh);
+  await until(async () => (await progress(fresh)).text === '–', 'a follow-up to start the bar again');
+  await until(() => page.evaluate((i) => window.fleet.call('snapshot').then((s) => !!s.cards.find((c) => c.id === i).attention), fresh), 'its reply');
+  await page.evaluate((i) => window.fleet.call('dismissAttention', i), fresh);
+});
+
+const flowOf = () => page.evaluate(() => document.querySelector('[data-flow]')?.dataset.flow ?? null);
+const flowText = () => page.evaluate(() => document.querySelector('[data-flow-text]')?.innerText ?? '');
+const dismissIfWaiting = (id) => page.evaluate((i) => window.fleet.call('dismissAttention', i), id);
+
+await step('the master chat has its own bar, Ctrl+0 opens it, and it has no stages or files', async () => {
+  await page.click('[data-composer]');
+  await page.keyboard.press('Control+0');
+  await until(() => page.evaluate(() => document.querySelector('[data-master-bar]').classList.contains('selected')), 'the master chat to open');
+  await until(() => page.evaluate(() => document.querySelector('[data-composer]').placeholder.includes('master chat')), 'its message box');
+  assert.equal(await flowOf(), null);
+  assert.equal(await page.evaluate(() => document.querySelectorAll('.tabs button').length), 1);
+  const text = await page.evaluate(() => document.querySelector('.transcript').innerText);
+  assert.ok(text.includes('Refactor the watering schedule'), 'it has seen the requests');
+  assert.ok(text.includes('Started agent'), 'and says what it did with them');
+  await page.screenshot({ path: path.join(shots, '14-master-chat.png') });
+});
+
+await step('Issue found sends it straight back to the agent with what you wrote', async () => {
+  const id = await spawn('testing', 'Greenhouse gate should close at night');
+  await page.click(`[data-card="${id}"]`);
+  await page.waitForSelector('[data-checklist]', { timeout: 20000 });
+  await page.click('[data-issue]');
+  await page.waitForSelector('[data-issue-text]');
+  assert.equal(await page.evaluate(() => document.querySelector('[data-issue-send]').disabled), true, 'it wants to know what is wrong');
+  await page.keyboard.type('It closes during the day too');
+  await page.screenshot({ path: path.join(shots, '15-issue-found.png') });
+  await page.click('[data-issue-send]');
+  await page.waitForSelector('[data-checklist]', { state: 'detached' });
+  assert.equal(await flowOf(), 'building');
+  assert.match(await flowText(), /making the change/);
+  await until(() => page.evaluate(() => document.querySelector('.transcript').innerText.includes('It closes during the day too')), 'the issue in the chat');
+  await until(() => page.evaluate((i) => window.fleet.call('snapshot').then((s) => !!s.cards.find((c) => c.id === i).attention), id), 'its reply');
+  await dismissIfWaiting(id);
+});
+
+await step('Approve takes a tested task through to complete, and says where things ended up', async () => {
+  const id = await spawn('testing', 'Greenhouse door should stay shut');
+  await page.click(`[data-card="${id}"]`);
+  await page.waitForSelector('[data-checklist]', { timeout: 20000 });
+  assert.equal(await flowOf(), 'testing');
+  await page.click('[data-approve]');
+  await page.waitForSelector('[data-checklist]', { state: 'detached' });
+  await until(async () => (await flowOf()) === 'complete', 'complete');
+  assert.match(await flowText(), /Done/);
+  assert.match(await page.evaluate((i) => document.querySelector(`[data-card="${i}"] .card-status`).innerText, id), /^COMPLETE/);
+  assert.equal(await page.evaluate(() => document.querySelectorAll('.flow-steps.labelled li.done').length), 7);
+  await page.screenshot({ path: path.join(shots, '16-complete.png') });
+});
+
+await step('Open editor explains itself when it can not run', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-ui-project-'));
+  const file = path.join(dir, 'NoEngine.uproject');
+  fs.writeFileSync(file, '{"EngineAssociation":"0.1"}');
+  const id = await page.evaluate((f) => window.fleet.call('createAgent', { prompt: 'A task with a project', projectFile: f, nodeId: 'master', model: 'claude-opus-5-5', effort: 'low', permissionMode: 'default', instanceMode: 'offscreen', demo: 'testing' }), file);
+  await page.click(`[data-card="${id}"]`);
+  await page.waitForSelector('[data-open-editor]', { timeout: 20000 });
+  await page.click('[data-open-editor]');
+  await page.waitForSelector('[data-test-run="failed"]', { timeout: 15000 });
+  assert.match(await page.evaluate(() => document.querySelector('[data-test-run]').innerText), /No Unreal Engine/);
+  assert.equal(await flowOf(), 'testing', 'it stays in testing');
+  await page.click('[data-approve]');
+  await until(async () => (await flowOf()) === 'complete', 'complete');
+  await page.click('.tabs button:nth-child(2)');
+  await page.waitForSelector('.changes');
+  await page.click('.tabs button:nth-child(1)');
+});
+
+const transcriptText = () => page.evaluate(() => document.querySelector('.transcript').innerText);
+
+await step('Messages only leaves just the messages in the chat, and hands the keyboard back', async () => {
+  await page.click(`[data-card="${ids.clean}"]`);
+  await page.waitForSelector('.transcript .tool');
+  await page.click('[data-messages-only]');
+  await page.waitForSelector('.transcript .tool', { state: 'detached' });
+  const text = await transcriptText();
+  assert.equal(await page.evaluate(() => document.querySelector('[data-flow-text]').isConnected), true, 'where things stand still shows');
+  assert.ok(text.includes('Fix the paper lantern null pointer crash'), 'what the user asked');
+  assert.ok(text.includes('Looking at how this is set up'), 'what the agent said');
+  assert.ok(text.includes('Fixed the crash when a paper lantern lands'), 'its closing message');
+  assert.equal(await page.evaluate(() => document.activeElement?.hasAttribute('data-composer')), true);
+  await page.screenshot({ path: path.join(shots, '12-messages-only.png') });
+});
+
+await step('it applies to every chat, but a prompt still waiting stays until it is answered', async () => {
+  const waiting = await spawn('permission', 'Clear out the old sprinkler logs');
+  await page.click(`[data-card="${waiting}"]`);
+  await page.waitForSelector('[data-permission]', { timeout: 15000 });
+  assert.equal(await page.evaluate(() => document.querySelector('.transcript .tool')), null);
+  await page.keyboard.press('1');
+  await page.waitForSelector('[data-permission]', { state: 'detached' });
+  assert.ok(!(await transcriptText()).includes('Bash: allowed'), 'the answered prompt goes too');
+  await page.evaluate((id) => window.fleet.call('stopAgent', id), waiting);
+});
+
+await step('the tabs that are not the chat have no such toggle', async () => {
+  await page.click('.tabs button:nth-child(3)');
+  assert.equal(await page.evaluate(() => document.querySelector('[data-messages-only]')), null);
+  await page.click('.tabs button:nth-child(1)');
+});
+
+await step('it is remembered, and turning it off brings everything back', async () => {
+  await page.reload();
+  await page.waitForSelector('.topbar');
+  await page.waitForSelector('[data-messages-only]');
+  assert.equal(await page.evaluate(() => document.querySelector('[data-messages-only]').checked), true);
+  await page.click(`[data-card="${ids.clean}"]`);
+  await until(transcriptText, 'the chat to load');
+  assert.equal(await page.evaluate(() => document.querySelector('.transcript .tool')), null);
+  await page.click('[data-messages-only]');
+  await page.waitForSelector('.transcript .tool');
 });
 
 await step('no renderer errors', async () => {

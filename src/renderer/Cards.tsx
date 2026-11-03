@@ -1,9 +1,9 @@
 import { memo, useMemo } from 'react';
-import { BUCKETS, modelLabel, type ActivityBucket, type AgentCard, type AgentStatus, type MachineView, type SlotInfo } from '../shared/protocol';
+import { BUCKETS, FLOW_STAGES, modelLabel, type ActivityBucket, type AgentCard, type AgentStatus, type MachineView, type SlotInfo } from '../shared/protocol';
 import { fmtAgo, fmtDuration, fmtShort, fmtTokens, pad2, select, setState, useStore } from './store';
 
 export const STATUS_LABEL: Record<AgentStatus, string> = {
-  queued: 'QUEUED', provisioning: 'COPYING', working: 'WORKING', tools: 'TOOLS', coding: 'CODING', building: 'BUILDING', testing: 'TESTING',
+  queued: 'QUEUED', provisioning: 'PREPARING', working: 'WORKING', tools: 'TOOLS', coding: 'CODING', building: 'BUILDING', testing: 'TESTING',
   'waiting-instance': 'WAITING', attention: 'NEEDS YOU', idle: 'IDLE', finished: 'FINISHED', error: 'ERROR', stopped: 'STOPPED',
 };
 
@@ -46,6 +46,49 @@ export function BucketBar({ buckets }: { buckets: Record<ActivityBucket, number>
   );
 }
 
+// Stopped and failed say so, since those aren't places in the flow. Anything else is where it's up to,
+// plus whether it's waiting on you.
+export function stageLabel(c: AgentCard) {
+  if (c.status === 'stopped' || c.status === 'error') return STATUS_LABEL[c.status];
+  const stage = FLOW_STAGES.find((s) => s.id === c.stage)?.label.toUpperCase() ?? STATUS_LABEL[c.status];
+  return c.attention ? `${stage} · NEEDS YOU` : stage;
+}
+
+export function FlowSteps({ c, labelled }: { c: AgentCard; labelled?: boolean }) {
+  const at = FLOW_STAGES.findIndex((s) => s.id === (c.stage ?? 'preparing'));
+  const paused = !!c.attention || c.status === 'stopped' || c.status === 'error';
+  return (
+    <ol className={`flow-steps${labelled ? ' labelled' : ''}`} aria-label={`Stage: ${FLOW_STAGES[at]?.label}`}>
+      {FLOW_STAGES.map((s, i) => <li key={s.id} title={s.label} className={i < at ? 'done' : i === at ? (c.stage === 'complete' ? 'done' : paused ? 'now paused' : 'now') : ''}>{labelled && <span>{s.label}</span>}</li>)}
+    </ol>
+  );
+}
+
+export function MasterBar() {
+  const c = useStore((s) => s.snapshot.cards.find((x) => x.isMaster));
+  const selected = useStore((s) => s.selectedId === c?.id);
+  if (!c) return null;
+  return (
+    <button className={`master-bar s-${c.status}${selected ? ' selected' : ''}`} onClick={() => void select(c.id)} data-card={c.id} data-master-bar>
+      <StatusGlyph c={c} />
+      <span className="master-name">Master chat</span>
+      <kbd>Ctrl 0</kbd>
+      <span className="master-msg">{c.attention?.text ?? (c.lastText || 'New tasks come here first, and agents ask it for anything only this PC can reach.')}</span>
+      {c.tokens > 0 && <span className="master-tokens">{fmtTokens(c.tokens)}</span>}
+    </button>
+  );
+}
+
+function TaskProgress({ c }: { c: AgentCard }) {
+  const percent = c.final ? 100 : c.progress;
+  return (
+    <div className="card-progress" role="progressbar" aria-label="Task progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
+      <div className="progress-track"><span className="progress-fill" style={{ width: `${percent ?? 0}%` }} /></div>
+      <span className="progress-text">{percent == null ? '–' : `${percent}%`}</span>
+    </div>
+  );
+}
+
 function StatusGlyph({ c }: { c: AgentCard }) {
   if (c.status === 'finished') return <span className="glyph glyph-done">✓</span>;
   if (c.status === 'attention') return <span className="glyph glyph-attn">!</span>;
@@ -63,8 +106,10 @@ export const Card = memo(function Card({ c, selected, now, machine }: { c: Agent
         <StatusGlyph c={c} />
         <span className="card-num">{pad2(c.index)}</span>
         <span className="card-title">{c.title}</span>
-        <span className="card-status">{STATUS_LABEL[c.status]}</span>
+        <span className="card-status" data-stage={c.stage}>{stageLabel(c)}</span>
       </div>
+      <FlowSteps c={c} />
+      <TaskProgress c={c} />
       <div className="card-msg">
         <span className="card-msg-text">{c.attention?.text && c.status === 'attention' ? c.attention.text : (c.detail && c.status === 'provisioning' ? c.detail : c.lastText || 'Starting…')}</span>
         <span className="card-msg-age">{fmtAgo(c.lastTextAt || c.createdAt, now)}</span>
@@ -101,12 +146,13 @@ export function CardGrid() {
   const filter = useStore((s) => s.filter);
   const now = useStore((s) => s.now);
 
-  const visible = cards.filter((c) => !c.archived && (!filter || `${c.title} ${c.project} ${c.status} ${c.lastPrompt}`.toLowerCase().includes(filter.toLowerCase())));
-  if (!visible.length && !cards.filter((c) => !c.archived).length) {
+  const tasks = cards.filter((c) => !c.archived && !c.isMaster);
+  const visible = tasks.filter((c) => !filter || `${c.title} ${c.project} ${c.stage} ${c.status} ${c.lastPrompt}`.toLowerCase().includes(filter.toLowerCase()));
+  if (!tasks.length) {
     return (
       <div className="empty">
         <h2>No tasks running</h2>
-        <p>Each task gets its own Unreal editor, and they all work from the project's own files.</p>
+        <p>Say what needs doing and the master chat picks the best PC. Each task gets its own Unreal editor, and they all work from the project's own files.</p>
         <button className="btn primary" onClick={() => setState({ modal: 'new' })}>New task <kbd>Ctrl N</kbd></button>
       </div>
     );

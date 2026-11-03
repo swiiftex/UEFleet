@@ -10,7 +10,7 @@ export class DemoRunner {
   private waiters = new Map<string, () => void>();
   running = true;
 
-  constructor(private spawn: AgentSpawn, private emit: (ev: AgentEvent) => void) {}
+  constructor(private spawn: AgentSpawn, private emit: (ev: AgentEvent) => void, private askMaster: (question: string) => Promise<string> = async () => '') {}
 
   private id(p: string) { return `${p}-${this.spawn.id}-${++this.seq}`; }
 
@@ -53,10 +53,17 @@ export class DemoRunner {
   private async script(kind: string) {
     await sleep(300);
     await this.say('Looking at how this is set up in the project.');
+    this.emit({ k: 'progress', percent: 15 });
     await this.useTool('Read', { file_path: 'Source/Game/Garden/SprinklerComponent.cpp' }, '… 212 lines …');
+    this.emit({ k: 'progress', percent: 30 });
     await this.useTool('Edit', { file_path: 'Source/Game/Garden/SprinklerComponent.cpp' }, 'Updated.', 'coding');
+    this.emit({ k: 'progress', percent: 50 });
     if (kind === 'long') { await this.keepBusy(); return; }
 
+    if (kind === 'ask') {
+      const answer = await this.askMaster('What does ticket GARDEN-12 say about the sprinkler?');
+      await this.say(`The master says: ${answer}`);
+    }
     if (kind === 'permission') {
       const id = this.id('p');
       this.emit({ k: 'item', item: { kind: 'permission', id, at: Date.now(), tool: 'Bash', input: { command: 'git clean -fdx Intermediate' }, canAlways: true, reason: 'Deletes untracked files.' } });
@@ -73,7 +80,9 @@ export class DemoRunner {
       await this.waitFor(id);
     }
     await this.useTool('mcp__fleet__ue_build', {}, 'BUILD SUCCEEDED in 41s', 'building', 1200);
+    this.emit({ k: 'progress', percent: 70 });
     await this.useTool('mcp__fleet__ue_call', { tool_name: 'StartPIE' }, 'PIE running', 'testing', 900);
+    this.emit({ k: 'progress', percent: 90 });
 
     if (kind === 'testing') {
       await this.say('The sprinkler now only runs during the morning cycle. I tested the timing in PIE, but how the mist looks needs a person.');
@@ -81,8 +90,8 @@ export class DemoRunner {
         summary: 'The greenhouse sprinkler now only runs at dawn, and walking past it no longer sets it off.',
         verified: ['Compiled with no errors', 'Automation test Garden.Sprinkler passes', 'Water events fire only during the morning cycle in PIE'],
         needsTesting: [
-          { what: 'Walk past the sprinkler at the last moment', how: 'Greenhouse_2, stand still until it is one step away, then sidestep', why: 'Whether it looks right depends on timing I can\'t judge' },
-          { what: 'Standing under it while it runs', why: 'Mist density is a look-and-feel call' },
+          { what: 'Walk past the sprinkler at the last moment', how: 'Open Greenhouse_2 and press Play. Stand still until the sprinkler is one step away, then sidestep.', expect: 'It stays off until dawn and doesn\'t react to you walking past.', why: 'Whether it looks right depends on timing I can\'t judge' },
+          { what: 'Standing under it while it runs', how: 'In the same map, set the time to dawn with the console command SetTime 6, then stand under the sprinkler.', expect: 'A light mist falls for about ten seconds, then stops.', why: 'Mist density is a look-and-feel call' },
         ],
         at: Date.now(),
       } });
@@ -100,9 +109,12 @@ export class DemoRunner {
   }
 
   private async keepBusy() {
+    let percent = 50;
     while (!this.stopped) {
       await this.say('Still working through the remaining call sites. ');
       await this.useTool('Grep', { pattern: 'WaterPlants' }, '14 matches', 'tools', 1500);
+      percent = Math.min(95, percent + 5);
+      this.emit({ k: 'progress', percent });
     }
   }
 

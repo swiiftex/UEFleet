@@ -1,17 +1,20 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Notification, shell } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
-import { Hub } from '../hub/hub';
+import { Hub, type LocalHostCommand } from '../hub/hub';
 import { dataRoot } from '../node/machine';
 import type { AgentCard, HubEvent } from '../shared/protocol';
 
 const VERSION = '1.0.0';
+const VERSION_POLL_MS = 1500;
 const demo = process.env.FLEET_DEMO === '1';
 const dataDir = process.env.FLEET_DATA ?? dataRoot('uefleet');
+// A second copy with its own data shouldn't share a window's saved settings with the real one either.
+if (process.env.FLEET_DATA) app.setPath('userData', path.join(dataDir, 'window'));
 const CALLABLE = new Set([
-  'snapshot', 'createAgent', 'send', 'broadcast', 'decide', 'answer', 'interrupt', 'stopAgent', 'archive',
+  'snapshot', 'createAgent', 'request', 'send', 'broadcast', 'decide', 'answer', 'interrupt', 'stopAgent', 'archive',
   'dismissAttention', 'transcript', 'setTestDone', 'addProject', 'setMaxInstances', 'rotatePairing',
-  'forgetMachine', 'changes', 'apply', 'applyFinished', 'log', 'stopInstance',
+  'forgetMachine', 'changes', 'log', 'stopInstance', 'testChanges', 'approve', 'reportIssue', 'resolveConflicts', 'restartHost',
 ]);
 
 let win: BrowserWindow | null = null;
@@ -19,6 +22,8 @@ let hub: Hub;
 
 function hostAppPath(): string | null {
   const candidates = [
+    // A deployed version carries its own, next to this file.
+    path.join(__dirname, 'fleet-host.exe'),
     path.join(process.resourcesPath ?? '', 'fleet-host.exe'),
     path.join(app.getAppPath(), 'release', 'fleet-host.exe'),
     path.join(app.getAppPath(), '..', 'release', 'fleet-host.exe'),
@@ -26,10 +31,66 @@ function hostAppPath(): string | null {
   return candidates.find((c) => fs.existsSync(c)) ?? null;
 }
 
+// This PC's agents and editors run in a host of their own, so restarting the app leaves them running.
+function localHost(): LocalHostCommand | undefined {
+  if (process.env.FLEET_INLINE_LOCAL === '1') return undefined;
+  if (!app.isPackaged) return { command: process.execPath, args: [path.join(__dirname, 'host', 'fleet-host.cjs')], env: { ELECTRON_RUN_AS_NODE: '1' } };
+  const from = hostAppPath();
+  return from ? { command: path.join(dataDir, 'host', 'fleet-host.exe'), args: [], installFrom: from } : undefined;
+}
+
+// ---- New versions ----
+// `npm run deploy` puts a version under app/<id> in the data folder and points current.json at it.
+
+interface VersionFile { id: string; main: string; preload: string; renderer: string; host?: string }
+
+const readJson = <T,>(file: string): T | null => {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+};
+const versionsDir = path.join(dataDir, 'app');
+const running = readJson<VersionFile>(path.join(__dirname, 'version.json'));
+let pending: VersionFile | null = null;
+let shownRenderer = running?.renderer;
+let shownHost = running?.host;
+
+function checkForNewVersion() {
+  const current = readJson<VersionFile>(path.join(versionsDir, 'current.json'));
+  if (!current || current.id === (pending?.id ?? running?.id)) return;
+  const version = readJson<VersionFile>(path.join(versionsDir, current.id, 'version.json'));
+  if (!version) return;
+  pending = version;
+  if (version.host && version.host !== shownHost) {
+    shownHost = version.host;
+    void hub.setHostExe(path.join(versionsDir, version.id, 'fleet-host.exe'));
+  }
+  const needsRestart = version.main !== running?.main || version.preload !== running?.preload;
+  if (needsRestart || version.renderer !== shownRenderer) hub.setAppUpdate({ id: version.id, needsRestart });
+}
+
+async function applyUpdate() {
+  if (!pending) return;
+  const version = pending;
+  if (version.main !== running?.main || version.preload !== running?.preload) {
+    quitting = true;
+    await hub.detach();
+    if (process.env.FLEET_TEST_NO_RELAUNCH !== '1') app.relaunch();
+    app.exit(0);
+    return;
+  }
+  // Only the screens changed, and everything they show lives in the hub, so nothing is lost.
+  shownRenderer = version.renderer;
+  hub.setAppUpdate(null);
+  await win?.loadFile(path.join(versionsDir, version.id, 'renderer', 'index.html'));
+}
+
 function createWindow() {
+  // For tests on a PC someone is using: it still renders, but stays off screen and never takes focus.
+  const unseen = process.env.FLEET_TEST_UNSEEN === '1';
   win = new BrowserWindow({
     width: 1800,
     height: 1000,
+    show: !unseen,
+    ...(unseen ? { x: -6000, y: 0 } : {}),
     minWidth: 1100,
     minHeight: 640,
     backgroundColor: '#090c11',
@@ -43,6 +104,7 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+  if (unseen) win.showInactive();
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/.test(url)) void shell.openExternal(url);
@@ -54,7 +116,7 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
-  hub = new Hub({ dataDir, version: VERSION, demo, hostAppPath: hostAppPath() });
+  hub = new Hub({ dataDir, version: VERSION, demo, hostAppPath: hostAppPath(), localHost: localHost() });
   hub.on('hub', (e: HubEvent) => win?.webContents.send('hub:event', e));
   hub.on('attention', (card: AgentCard) => {
     if (!win || win.isFocused() || !card.attention) return;
@@ -79,9 +141,11 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('app:copy', (_e, text: string) => clipboard.writeText(text));
   ipcMain.handle('app:reveal', (_e, p: string) => shell.showItemInFolder(p));
+  ipcMain.handle('app:applyUpdate', () => applyUpdate());
 
   await hub.start();
   createWindow();
+  setInterval(checkForNewVersion, VERSION_POLL_MS);
 });
 
 let quitting = false;

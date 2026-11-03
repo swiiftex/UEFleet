@@ -1,5 +1,6 @@
 // Bundles the master app (Electron main, preload, UI) and the standalone remote host.
 import { build } from 'esbuild';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -19,6 +20,7 @@ const node = {
 };
 
 await Promise.all([
+  build({ ...node, entryPoints: [path.join(root, 'src/main/loader.ts')], outfile: path.join(dist, 'loader.cjs'), external: ['electron', './main.cjs'] }),
   build({ ...node, entryPoints: [path.join(root, 'src/main/main.ts')], outfile: path.join(dist, 'main.cjs'), external: ['electron'] }),
   build({ ...node, entryPoints: [path.join(root, 'src/main/preload.ts')], outfile: path.join(dist, 'preload.cjs'), external: ['electron'], banner: {}, define: {} }),
   // Single-executable Node can't do dynamic import() at runtime, so everything becomes require().
@@ -40,4 +42,18 @@ await Promise.all([
 fs.renameSync(path.join(dist, 'renderer', 'js.js'), path.join(dist, 'renderer', 'app.js'));
 fs.renameSync(path.join(dist, 'renderer', 'css.css'), path.join(dist, 'renderer', 'app.css'));
 fs.copyFileSync(path.join(root, 'src/renderer/index.html'), path.join(dist, 'renderer', 'index.html'));
+
+// What's in this build, so a new version can be compared part by part.
+const hash = (...files) => {
+  const h = crypto.createHash('sha256');
+  for (const f of files) h.update(fs.readFileSync(path.join(dist, f)));
+  return h.digest('hex');
+};
+fs.writeFileSync(path.join(dist, 'version.json'), JSON.stringify({
+  id: 'built-in',
+  main: hash('main.cjs'),
+  preload: hash('preload.cjs'),
+  renderer: hash('renderer/app.js', 'renderer/app.css', 'renderer/index.html'),
+  hostSource: hash('host/fleet-host.cjs'),
+}, null, 2));
 console.log('Built.');

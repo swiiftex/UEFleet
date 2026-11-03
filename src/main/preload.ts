@@ -7,4 +7,5 @@ contextBridge.exposeInMainWorld('fleet', {
   pickProject: () => ipcRenderer.invoke('app:pickProject'),
   copy: (text: string) => ipcRenderer.invoke('app:copy', text),
   reveal: (p: string) => ipcRenderer.invoke('app:reveal', p),
+  applyUpdate: () => ipcRenderer.invoke('app:applyUpdate'),
 });

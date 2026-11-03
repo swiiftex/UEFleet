@@ -63,7 +63,10 @@ const SCRIPTS: Record<string, Step[]> = {
     fin('$LAST_RESULT', ['Asked the user']),
     { text: 'Done.' },
   ],
-  testing: [fin('Tuned the jump.', ['Read the code'], [{ what: 'Try the jump', why: 'Feel is a human call' }]), { text: 'Done.' }],
+  testing: [fin('Tuned the jump.', ['Read the code'], [{ what: 'Try the jump', how: 'Press Play and jump', expect: 'It lands softly', why: 'Feel is a human call' }]), { text: 'Done.' }],
+  'master-route': [{ tool: { name: 'mcp__fleet__start_task', input: { prompt: 'From the master [script:testing]', title: 'Routed by the master' } } }, { text: 'Started it.' }],
+  'master-answer': [{ tool: { name: 'mcp__fleet__answer_agent', input: { request_id: '$REQUEST_ID', answer: 'the ticket says blue' } } }, { text: 'Answered.' }],
+  asks: [{ tool: { name: 'mcp__fleet__ask_master', input: { question: 'What does NIGH-1 say? [script:master-answer]' } } }, fin('$LAST_RESULT', ['Asked the master']), { text: 'Done.' }],
   reply: [{ text: 'Two possible causes. Which do you want fixed?' }],
   followup: [fin('Followed up: $HAS_HISTORY', ['Remembered the conversation']), { text: 'Done.' }],
   remote: [
@@ -72,13 +75,14 @@ const SCRIPTS: Record<string, Step[]> = {
     fin('Changed a file on the host.', ['Checked the editor there']),
     { text: 'Done.' },
   ],
-  crash: [ue('IsPIERunning'), { tool: { name: 'mcp__fleet__ue_status', input: {} } }, fin('Recovered after a crash.', ['Editor came back']), { text: 'Done.' }],
+  crash: [{ tool: { name: 'mcp__fleet__report_progress', input: { percent: 40 } } }, ue('IsPIERunning'), { tool: { name: 'mcp__fleet__ue_status', input: {} } }, fin('Recovered after a crash.', ['Editor came back']), { text: 'Done.' }],
 };
 
 // ---- The scripted API ----
 
 const seen: { marker: string; messages: any[]; tools: string[] }[] = [];
 const systemSeen = new Map<string, unknown>();
+const sysFor = (marker: string) => JSON.stringify(systemSeen.get(marker) ?? '');
 function lastResultText(messages: any[]) {
   for (let i = messages.length - 1; i >= 0; i--) {
     const c = messages[i].content;
@@ -101,11 +105,13 @@ const api = http.createServer((req, res) => {
     const json = JSON.parse(body);
     const messages: any[] = json.messages ?? [];
     const hasTools = (json.tools ?? []).length > 0;
-    // Find the latest scripted instruction and count what happened after it.
+    // Find the latest scripted instruction and count what happened after it. Only in what was said,
+    // and the last one said, because tool results and agents' titles quote other agents' prompts.
     let marker = '';
     let from = 0;
     messages.forEach((m, i) => {
-      const hit = JSON.stringify(m.content).match(/\[script:([a-z-]+)\]/);
+      const said = typeof m.content === 'string' ? m.content : m.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('\n');
+      const hit = [...said.matchAll(/\[script:([a-z-]+)\]/g)].at(-1);
       if (m.role === 'user' && hit) { marker = hit[1]; from = i; }
     });
     let step = 0;
@@ -119,6 +125,10 @@ const api = http.createServer((req, res) => {
     if (s.tool?.input?.summary?.includes('$')) {
       const history = JSON.stringify(messages);
       s = { tool: { ...s.tool, input: { ...s.tool.input, summary: s.tool.input.summary.replace('$LAST_RESULT', lastResultText(messages)).replace('$HAS_HISTORY', String(history.includes('[script:question]'))) } } };
+    }
+    if (s.tool?.input?.request_id === '$REQUEST_ID') {
+      const asked = [...JSON.stringify(messages).matchAll(/request_id: ([^\\\s"]+)/g)].at(-1)?.[1];
+      s = { tool: { ...s.tool, input: { ...s.tool.input, request_id: asked } } };
     }
     const id = `msg_${crypto.randomBytes(6).toString('hex')}`;
     const sse = (type: string, data: any) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
@@ -212,8 +222,8 @@ try {
   check('their editors wrote to their own folders', fs.existsSync(path.join(ca.slot.own, 'Saved')) && fs.existsSync(path.join(cb.slot.own, 'Saved')));
   const isPie = tools(a).find((t) => JSON.stringify(t.input).includes('IsPIERunning'));
   check('the CLI reached the editor and got a real answer', !!isPie?.result?.includes('true'), isPie);
-  for (let i = 0; i < 100 && hub.local.slots.editors.inUse > 0; i++) await sleep(100);
-  check('finishing stops the editor and frees its place', hub.local.slots.editors.inUse === 0, hub.local.slots.editors.inUse);
+  for (let i = 0; i < 100 && hub.local!.slots.editors.inUse > 0; i++) await sleep(100);
+  check('finishing stops the editor and frees its place', hub.local!.slots.editors.inUse === 0, hub.local!.slots.editors.inUse);
   check('verified tasks raised no popup', ca.attention === null && cb.attention === null);
   check('nothing was added to the test list', hub.testList().length === 0, hub.testList());
   check('tokens and context are tracked', ca.tokens > 1000 && ca.usage.context > 0, [ca.tokens, ca.usage]);
@@ -230,7 +240,8 @@ try {
     check('the model receives it as an image block, not base64 text', blob.includes('"type":"image"') && !/"data\\":\\"[A-Za-z0-9+/]{2000}/.test(blob));
   }
   const tl = seen.find((s) => s.marker === 'pie-a')!.tools;
-  check('agents get the fleet tools', tl.includes('mcp__fleet__ue_call') && tl.includes('mcp__fleet__finish_task'), tl.slice(0, 40));
+  check('agents get the fleet tools', tl.includes('mcp__fleet__ue_call') && tl.includes('mcp__fleet__finish_task') && tl.includes('mcp__fleet__report_progress'), tl.slice(0, 40));
+  check('and are told to report progress', sysFor('pie-a').includes('Call report_progress'));
   check('agents cannot see any other Unreal MCP server', !tl.some((t) => t.startsWith('mcp__') && !t.startsWith('mcp__fleet__')), tl.filter((t) => t.startsWith('mcp__')));
   const sys = JSON.stringify(systemSeen.get('pie-a') ?? '');
   check('the instance instructions reach the agent', sys.includes('Your Unreal instance'), sys.slice(0, 200));
@@ -246,12 +257,16 @@ try {
   const applied = await hub.apply(a);
   check('and there is nothing to apply', applied.applied.length === 0 && applied.conflicts.length === 0, applied);
   check('B can see A in the folder', tools(b).some((t) => t.name === 'mcp__fleet__ue_status' && t.result?.includes('otherAgentsHere')), tools(b).find((t) => t.name === 'mcp__fleet__ue_status'));
+  check('only the agent that changed a file has it on its list', !(await hub.changes(b)).some((c: any) => c.path.replaceAll('\\', '/') === 'Config/DefaultGame.ini'));
+  await waitFor(a, (c) => c.stage === 'complete', 'A to complete', 60_000);
+  check('having checked its own work, A went through to complete by itself', card(a).merge?.files >= 1 && !card(a).attention, card(a).merge);
   fs.rmSync(iniSrc, { force: true });
 
   log('Editor crash recovery');
   const rc = await hub.createAgent(task('crash', { projectFile: PROJECT, permissionMode: 'default' }));
-  await waitFor(rc, settled, 'the crash agent');
-  const slot = hub.local.slots.get(rc)!;
+  const doneRc = await waitFor(rc, settled, 'the crash agent');
+  check('an agent reports progress through the real CLI, with no prompt, even in the strictest mode', doneRc.progress === 40 && doneRc.status === 'finished', [doneRc.progress, doneRc.status, doneRc.attention]);
+  const slot = hub.local!.slots.get(rc)!;
   // Right after finishing, the editor is on its way down. Asking for it must give a fresh one.
   await slot.ensureEditor();
   check('asking during shutdown gives a live editor', slot.isRunning && slot.state === 'ready', slot.state);
@@ -269,7 +284,7 @@ try {
   process.kill(pid);
   await sleep(1500);
   check('a killed editor is seen as crashed', slot.state === 'crashed', slot.state);
-  check('and gives its place back', hub.local.slots.editors.inUse === 0, hub.local.slots.editors.inUse);
+  check('and gives its place back', hub.local!.slots.editors.inUse === 0, hub.local!.slots.editors.inUse);
   await slot.ensureEditor();
   check('the next use boots a new editor', slot.isRunning && slot.pid !== pid && slot.state === 'ready', slot.state);
   await slot.stopEditor();
@@ -310,6 +325,25 @@ try {
   const doneR = await waitFor(r, (c) => c.attention?.kind === 'reply', 'the reply', 90_000);
   check('stopping to ask is "waiting on you", not finished', doneR.status === 'attention' && !doneR.final);
 
+  log('The master chat');
+  const beforeRoute = hub.snapshot().cards.length;
+  await hub.request(task('master-route'));
+  const end = Date.now() + 90_000;
+  while (hub.snapshot().cards.length === beforeRoute && Date.now() < end) await sleep(100);
+  const routed = hub.snapshot().cards.at(-1) as any;
+  check('a request reaches the master through the real CLI, and it starts the agent', routed?.title === 'Routed by the master', routed);
+  const doneRouted = await waitFor(routed.id, (c) => c.status === 'finished', 'the routed agent', 90_000);
+  check('that agent got the brief and paused for testing', doneRouted.stage === 'testing' && doneRouted.attention?.kind === 'testing', doneRouted);
+  check('with instructions for the checklist', hub.testList().some((t: any) => t.agentId === routed.id && t.test.how === 'Press Play and jump' && t.test.expect === 'It lands softly'));
+  check('and the master chat says what it did', hub.transcript('master-chat').some((t: Item) => t.kind === 'assistant' && t.text.includes('Started it')));
+  await hub.approve(routed.id);
+  check('Approve takes it through to complete', card(routed.id).stage === 'complete', card(routed.id).stage);
+
+  const asker = await hub.createAgent(task('asks'));
+  const doneAsk = await waitFor(asker, (c) => c.status === 'finished', 'the agent that asked', 90_000);
+  check('an agent gets an answer from the master through the real tools', /the ticket says blue/.test(doneAsk.final?.summary ?? ''), doneAsk.final);
+  check('and the master saw who was asking', hub.transcript('master-chat').some((t: Item) => t.kind === 'user' && t.text.startsWith('[Question from agent') && t.text.includes('NIGH-1')));
+
   log('Follow-ups');
   await hub.send(q, 'Now do this [script:followup]');
   const again = await waitFor(q, (c) => c.final?.summary?.startsWith('Followed up'), 'the follow-up', 90_000);
@@ -321,7 +355,7 @@ try {
 
   log('A real host process: project sent over, real CLI and real editor there, changes back');
   // Same PC, so the master's own editors have to be down for the ports to be free.
-  for (const c of hub.snapshot().cards) if (hub.local.slots.get(c.id)) await hub.local.slots.get(c.id)!.stopEditor();
+  for (const c of hub.snapshot().cards) if (hub.local!.slots.get(c.id)) await hub.local!.slots.get(c.id)!.stopEditor();
   const pairing = hub.snapshot().pairing!;
   const pairCode = encodePairCode({ ...decodePairCode(pairing.code), a: ['127.0.0.1'] });
   const hostLogBox = { text: '' };
@@ -345,6 +379,10 @@ try {
     const appliedRem = await hub.apply(rem);
     const landed = path.join(path.dirname(SENT_PROJECT), 'Source/Remote/FromHost.cpp');
     check('apply brings them back to the master', appliedRem.conflicts.length === 0 && fs.existsSync(landed) && fs.readFileSync(landed, 'utf8').includes('from the host'), appliedRem);
+
+    const askerRem = await hub.createAgent(task('asks', { nodeId: remote.info.id }));
+    const doneAskRem = await waitFor(askerRem, (c) => c.status === 'finished', 'the remote agent that asked', 90_000);
+    check("an agent on another machine can ask the master for what only it can reach", /the ticket says blue/.test(doneAskRem.final?.summary ?? ''), doneAskRem.final);
   } finally {
     hostProc.kill();
   }

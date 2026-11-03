@@ -1,9 +1,9 @@
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { modelLabel, type AgentCard, type ApplyResult, type ChangedFile, type FinalReport, type ImageAttachment, type Question, type TranscriptItem } from '../shared/protocol';
-import { isLive, STATUS_LABEL } from './Cards';
-import { fmtDuration, getState, pad2, useStore } from './store';
+import { modelLabel, type AgentCard, type ChangedFile, type FinalReport, type ImageAttachment, type Question, type TranscriptItem } from '../shared/protocol';
+import { FlowSteps, isLive, stageLabel } from './Cards';
+import { fmtDuration, getState, isMessage, pad2, setMessagesOnly, useStore } from './store';
 
 marked.setOptions({ gfm: true, breaks: false });
 
@@ -102,43 +102,26 @@ function QuestionCard({ agentId, item }: { agentId: string; item: Extract<Transc
   );
 }
 
-function FinalCard({ report, card, onChanges }: { report: FinalReport; card: AgentCard; onChanges: () => void }) {
-  const tests = useStore((s) => s.snapshot.testList);
+function FinalCard({ report }: { report: FinalReport }) {
   return (
     <div className="final-card">
-      <div className="final-head">Finished. {report.needsTesting.length ? 'Needs your testing' : 'Check this one'}</div>
+      <div className="final-head">Finished</div>
       <p className="final-summary">{report.summary}</p>
-      {report.needsTesting.length > 0 && (
-        <ul className="final-tests">
-          {report.needsTesting.map((t, i) => {
-            const key = `${card.id}:${i}`;
-            const done = tests.find((x) => x.key === key)?.done ?? false;
-            return (
-              <li key={key} className={done ? 'done' : ''}>
-                <label>
-                  <input type="checkbox" checked={done} onChange={(e) => void window.fleet.call('setTestDone', key, e.target.checked)} />
-                  <span><b>{t.what}</b>{t.how && <small>How: {t.how}</small>}{t.why && <small>Why you: {t.why}</small>}</span>
-                </label>
-              </li>
-            );
-          })}
-        </ul>
-      )}
       {report.verified.length > 0 && (
         <details className="final-verified"><summary>What the agent already checked ({report.verified.length})</summary><ul>{report.verified.map((v) => <li key={v}>{v}</li>)}</ul></details>
       )}
       {!report.verified.length && <p className="final-warn">The agent reported no checks of its own, so treat this as untested.</p>}
-      {card.project && <div className="prompt-actions"><button className="btn" onClick={onChanges}>Review changes</button></div>}
     </div>
   );
 }
 
-const Item = memo(function Item({ item, card, onChanges }: { item: TranscriptItem; card: AgentCard; onChanges: () => void }) {
+const Item = memo(function Item({ item, card }: { item: TranscriptItem; card: AgentCard }) {
   switch (item.kind) {
     case 'user':
       return (
-        <div className={`msg-user${item.broadcastId ? ' broadcast' : ''}`}>
+        <div className={`msg-user${item.broadcastId ? ' broadcast' : ''}${item.from ? ' from-other' : ''}`}>
           {item.broadcastId && <span className="msg-tag">to all</span>}
+          {item.from && <span className="msg-tag">from {item.from}</span>}
           {item.images?.map((src, i) => <img key={i} src={src} alt="Attachment" />)}
           <div className="msg-user-text">{item.text}</div>
         </div>
@@ -151,12 +134,120 @@ const Item = memo(function Item({ item, card, onChanges }: { item: TranscriptIte
     case 'permission': return <PermissionCard agentId={card.id} item={item} />;
     case 'question': return <QuestionCard agentId={card.id} item={item} />;
     case 'system': return <div className={`sys tone-${item.tone ?? 'info'}`}>{item.text}</div>;
-    case 'final': return <FinalCard report={item.report} card={card} onChanges={onChanges} />;
+    case 'final': return <FinalCard report={item.report} />;
   }
 });
 
-function Transcript({ card, onChanges }: { card: AgentCard; onChanges: () => void }) {
+const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`;
+
+// One plain sentence: what's happening with this task and where its files are right now.
+function flowText(c: AgentCard, machine: string) {
+  const inPlace = !!c.slot?.shared && c.nodeId === 'master';
+  const where = !c.slot ? null : inPlace ? 'your workspace' : c.slot.shared ? `the project folder on ${machine}` : `its private copy on ${machine}`;
+  const merged = c.merge?.files ?? 0;
+  if (c.status === 'stopped') return `Stopped.${where ? ` Its files are in ${where}.` : ''} Message it to carry on.`;
+  if (c.attention && !c.final) return `Paused: ${c.attention.text}`;
+  switch (c.stage) {
+    case 'preparing': return 'Getting ready. Nothing has changed yet.';
+    case 'building': return `The agent is making the change.${where ? ` Its files are in ${where}.` : ''}`;
+    case 'testing':
+      if (!c.final) return 'The agent is testing its own change.';
+      if (!c.project) return 'Your turn to test.';
+      if (inPlace) return 'Your turn to test. Its files are already in your workspace.';
+      return merged ? `Your turn to test. ${plural(merged, 'file')} from ${machine} are in your workspace.` : `Your turn to test. Its files are still in ${where ?? machine}. Open editor brings them into your workspace first.`;
+    case 'awaiting-merge':
+      if (c.merge?.conflicts?.length) return `Paused: ${plural(c.merge.conflicts.length, 'file')} also changed in your workspace. Choose which to keep.`;
+      if (c.merge?.error) return `Paused: couldn't merge. ${c.merge.error}`;
+      return `Approved. Bringing its files from ${where ?? machine} into your workspace.`;
+    case 'merged': return `${plural(merged, 'file')} are in your workspace.`;
+    case 'checking-in': return `${plural(merged, 'file')} are in your workspace. The master chat is putting them in a Plastic changelist.`;
+    case 'complete':
+      if (c.changelist) return `Done. ${plural(merged, 'file')} are in the Plastic changelist "${c.changelist}". Check it in from Plastic when you're ready.`;
+      return c.project && merged ? `Done. ${plural(merged, 'file')} are in your workspace, ready to check in.` : 'Done.';
+    default: return '';
+  }
+}
+
+const TEST_RUN_TEXT: Record<NonNullable<AgentCard['testRun']>['stage'], string> = {
+  pulling: 'Bringing its files into your workspace…',
+  building: 'Compiling…',
+  opening: 'Opening the editor…',
+  open: "The editor is opening in its own window. It's a real editor with your settings, so you can change things in it.",
+  'already-open': "You already have an editor open on this project. Close it and press Open editor again to load these changes, because it keeps the code it started with.",
+  failed: "That didn't work:",
+};
+
+function Checklist({ card }: { card: AgentCard }) {
+  const tests = useStore((s) => s.snapshot.testList).filter((t) => t.agentId === card.id);
+  const [issue, setIssue] = useState<string | null>(null);
+  useEffect(() => { setIssue(null); }, [card.id]);
+  const run = card.testRun;
+  const busy = !!run && ['pulling', 'building', 'opening'].includes(run.stage);
+  const left = tests.filter((t) => !t.done).length;
+  return (
+    <div className="checklist" data-checklist>
+      {tests.length ? (
+        <ol className="checks">
+          {tests.map((t) => (
+            <li key={t.key} className={t.done ? 'done' : ''}>
+              <label>
+                <input type="checkbox" checked={t.done} onChange={(e) => void window.fleet.call('setTestDone', t.key, e.target.checked)} />
+                <div>
+                  <b>{t.test.what}</b>
+                  {t.test.how && <p>{t.test.how}</p>}
+                  {t.test.expect && <p className="expect">You should see: {t.test.expect}</p>}
+                </div>
+              </label>
+            </li>
+          ))}
+        </ol>
+      ) : <p className="final-warn">The agent didn't list anything to test and didn't check its own work, so look it over yourself.</p>}
+      {run && <div className={`test-run${run.stage === 'failed' ? ' failed' : ''}`} data-test-run={run.stage}>{TEST_RUN_TEXT[run.stage]}{run.detail && <pre>{run.detail}</pre>}</div>}
+      {issue === null ? (
+        <div className="prompt-actions">
+          {card.project && <button className="btn" disabled={busy} onClick={() => void window.fleet.call('testChanges', card.id)} data-open-editor>{busy ? 'Working…' : 'Open editor'}</button>}
+          <button className="btn primary" onClick={() => void window.fleet.call('approve', card.id)} data-approve>Approve (tested){left && tests.length ? ` · ${left} not ticked` : ''}</button>
+          <button className="btn" onClick={() => setIssue('')} data-issue>Issue found</button>
+        </div>
+      ) : (
+        <div className="issue-box">
+          <textarea autoFocus rows={3} value={issue} placeholder="What's not right? This goes straight back to the agent." onChange={(e) => setIssue(e.target.value)} data-issue-text />
+          <div className="prompt-actions">
+            <button className="btn primary" disabled={!issue.trim()} onClick={() => { void window.fleet.call('reportIssue', card.id, issue.trim()); setIssue(null); }} data-issue-send>Send back to the agent</button>
+            <button className="btn" onClick={() => setIssue(null)}>Cancel</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Always at the top of a task, so there's one place that says what's going on and what you need to do.
+function FlowPanel({ card }: { card: AgentCard }) {
+  const machine = useStore((s) => s.snapshot.machines.find((m) => m.info.id === card.nodeId)?.info.name ?? 'that machine');
+  const conflicts = card.merge?.conflicts ?? [];
+  return (
+    <section className="flow" data-flow={card.stage}>
+      <FlowSteps c={card} labelled />
+      <p className="flow-text" data-flow-text>{flowText(card, machine)}</p>
+      {conflicts.length > 0 && (
+        <div className="conflicts" data-conflicts>
+          <ul className="change-list">{conflicts.map((c) => <li key={c.path}><span className="chg-path">{c.path}</span><small>{c.reason}</small></li>)}</ul>
+          <div className="prompt-actions">
+            <button className="btn primary" onClick={() => void window.fleet.call('resolveConflicts', card.id, 'agent')} data-use-agents>Use the agent's version</button>
+            <button className="btn" onClick={() => void window.fleet.call('resolveConflicts', card.id, 'mine')} data-keep-mine>Keep mine</button>
+          </div>
+        </div>
+      )}
+      {card.stage === 'awaiting-merge' && card.merge?.error && <div className="prompt-actions"><button className="btn primary" onClick={() => void window.fleet.call('approve', card.id)}>Try again</button></div>}
+      {card.stage === 'testing' && card.final && !conflicts.length && <Checklist card={card} />}
+    </section>
+  );
+}
+
+function Transcript({ card }: { card: AgentCard }) {
   const items = useStore((s) => s.transcripts[card.id]);
+  const messagesOnly = useStore((s) => s.messagesOnly);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const onScroll = () => {
@@ -166,10 +257,11 @@ function Transcript({ card, onChanges }: { card: AgentCard; onChanges: () => voi
   useLayoutEffect(() => { stick.current = true; }, [card.id]);
   useLayoutEffect(() => {
     if (stick.current && ref.current) ref.current.scrollTop = ref.current.scrollHeight;
-  }, [items]);
+  }, [items, messagesOnly]);
+  const shown = messagesOnly ? (items ?? []).filter(isMessage) : items ?? [];
   return (
     <div className="transcript" ref={ref} onScroll={onScroll}>
-      {(items ?? []).map((it) => <Item key={it.id} item={it} card={card} onChanges={onChanges} />)}
+      {shown.map((it) => <Item key={it.id} item={it} card={card} />)}
     </div>
   );
 }
@@ -219,7 +311,7 @@ function Composer({ card }: { card: AgentCard }) {
         value={text}
         rows={1}
         data-composer
-        placeholder={`Message ${pad2(card.index)}. Enter sends, Ctrl+Enter adds a line.`}
+        placeholder={`Message ${card.isMaster ? 'the master chat' : pad2(card.index)}. Enter sends, Ctrl+Enter adds a line.`}
         onChange={(e) => setText(e.target.value)}
         onPaste={(e) => { for (const it of e.clipboardData.items) { const f = it.getAsFile(); if (f) addFile(f); } }}
         onKeyDown={(e) => {
@@ -243,94 +335,40 @@ function Composer({ card }: { card: AgentCard }) {
   );
 }
 
-function ChangesTab({ card }: { card: AgentCard }) {
+// Only for looking. Merging happens through the flow, so there's one way for files to move.
+function FilesTab({ card }: { card: AgentCard }) {
   const [files, setFiles] = useState<ChangedFile[] | null>(null);
-  const [result, setResult] = useState<ApplyResult | null>(null);
+  const [all, setAll] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [unticked, setUnticked] = useState<Set<string>>(new Set());
   const refresh = useCallback(() => {
-    window.fleet.call<ChangedFile[]>('changes', card.id).then((list) => {
-      setFiles(list);
-      setUnticked(new Set(list.filter((f) => f.usuallySkipped).map((f) => f.path)));
-    }, (e) => setError(String(e?.message ?? e)));
-  }, [card.id]);
-  useEffect(() => { setFiles(null); setResult(null); setError(null); refresh(); }, [card.id, refresh]);
-  const chosen = (files ?? []).filter((f) => !unticked.has(f.path));
-  const apply = async (force?: string[]) => {
-    setBusy(true);
+    setFiles(null);
     setError(null);
-    try {
-      setResult(await window.fleet.call<ApplyResult>('apply', card.id, force ?? chosen.map((f) => f.path), force));
-      refresh();
-    } catch (e: any) { setError(String(e?.message ?? e)); }
-    setBusy(false);
-  };
-  const toggle = (p: string) => {
-    const next = new Set(unticked);
-    if (next.has(p)) next.delete(p); else next.add(p);
-    setUnticked(next);
-  };
+    window.fleet.call<ChangedFile[]>('changes', card.id, all).then(setFiles, (e) => setError(String(e?.message ?? e)));
+  }, [card.id, all]);
+  useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => { setAll(false); }, [card.id]);
   if (!card.project) return <div className="tab-empty">This task has no project attached.</div>;
-  // Work in a shared folder on this machine is already in the project, so there's nothing to do but look.
-  const inPlace = !!card.slot?.shared && card.nodeId === 'master';
-  if (inPlace) return (
+  return (
     <div className="changes">
-      <p className="changes-note">This agent works directly in your project, so there's nothing to apply. These files changed there since the task started, by any agent or by you. Deleted files don't show here, but your version control has them.</p>
+      <p className="changes-note">{all ? 'Everything that changed in this folder since the task started, by any agent or by you.' : 'The files this agent changed.'}</p>
       {error && <div className="sys tone-error">{error}</div>}
-      {files === null ? <div className="tab-empty">Scanning…</div> : files.length === 0 ? <div className="tab-empty">No changes.</div> : (
-        <ul className="change-list">
+      {files === null ? <div className="tab-empty">{all ? 'Scanning the whole project…' : 'Looking…'}</div> : files.length === 0 ? <div className="tab-empty">No changes.</div> : (
+        <ul className="change-list" data-files>
           {files.map((f) => (
             <li key={f.path}>
               <span className={`chg chg-${f.kind}`}>{f.kind[0].toUpperCase()}</span>
               <span className="chg-path">{f.path}</span>
               {f.binary && <span className="chg-bin">binary</span>}
+              {f.usuallySkipped && <span className="chg-bin">left out of merges</span>}
+              {all && f.mine && <span className="chg-bin">this agent</span>}
             </li>
           ))}
         </ul>
       )}
-      <div className="prompt-actions"><button className="btn" onClick={refresh}>Rescan</button></div>
-    </div>
-  );
-  return (
-    <div className="changes">
-      <p className="changes-note">{card.slot?.shared
-        ? `These files changed in the project folder on ${getState().snapshot.machines.find((m) => m.info.id === card.nodeId)?.info.name ?? 'that machine'} since the task started, by any agent there. Applying copies them into your project on this machine.`
-        : "These edits are only in this agent's private copy. Applying copies them into your real project."}</p>
-      {error && <div className="sys tone-error">{error}</div>}
-      {files === null ? <div className="tab-empty">Scanning…</div> : files.length === 0 ? <div className="tab-empty">No changes.</div> : (
-        <>
-          <ul className="change-list">
-            {files.map((f) => (
-              <li key={f.path}>
-                <label className="chg-row">
-                  <input type="checkbox" checked={!unticked.has(f.path)} onChange={() => toggle(f.path)} />
-                  <span className={`chg chg-${f.kind}`}>{f.kind[0].toUpperCase()}</span>
-                  <span className="chg-path">{f.path}</span>
-                  {f.binary && <span className="chg-bin">binary</span>}
-                  {f.usuallySkipped && <span className="chg-bin">usually skipped</span>}
-                </label>
-              </li>
-            ))}
-          </ul>
-          <div className="prompt-actions">
-            <button className="btn primary" disabled={busy || !chosen.length} onClick={() => void apply()}>{busy ? 'Applying…' : `Apply ${chosen.length} file${chosen.length === 1 ? '' : 's'} to the project`}</button>
-            <button className="btn" onClick={refresh}>Rescan</button>
-          </div>
-        </>
-      )}
-      {result && (
-        <div className="apply-result">
-          {result.applied.length + result.merged.length > 0 && <p>Applied {result.applied.length}{result.merged.length ? `, merged ${result.merged.length}` : ''}.</p>}
-          {result.conflicts.length > 0 && (
-            <>
-              <p className="final-warn">{result.conflicts.length} not applied:</p>
-              <ul className="change-list">{result.conflicts.map((c) => <li key={c.path}><span className="chg-path">{c.path}</span><small>{c.reason}</small></li>)}</ul>
-              <button className="btn" disabled={busy} onClick={() => void apply(result.conflicts.map((c) => c.path))}>Overwrite with the agent's version</button>
-            </>
-          )}
-        </div>
-      )}
+      <div className="prompt-actions">
+        <button className="btn" onClick={refresh}>Rescan</button>
+        {card.slot?.shared && <button className="btn" onClick={() => setAll(!all)}>{all ? 'Just this agent' : 'Everything in the folder'}</button>}
+      </div>
     </div>
   );
 }
@@ -349,25 +387,27 @@ function LogTab({ card }: { card: AgentCard }) {
   return <pre className="log" ref={ref}>{log || 'No editor log yet. The editor starts when the agent first needs it.'}</pre>;
 }
 
-// Archiving frees a private copy, which would wipe anything not applied yet. Work in a shared folder
+// Archiving frees a private copy, which would wipe anything not merged yet. Work in a shared folder
 // stays where it is.
 async function archive(card: AgentCard) {
-  const files = card.slot?.shared ? [] : await window.fleet.call<ChangedFile[]>('changes', card.id).catch(() => [] as ChangedFile[]);
-  if (files.length && !window.confirm(`${files.length} changed file${files.length === 1 ? ' hasn\'t' : 's haven\'t'} been applied to your project and will be lost. Archive anyway?`)) return;
+  const merged = ['merged', 'checking-in', 'complete'].includes(card.stage ?? '');
+  const files = card.slot?.shared || merged ? [] : await window.fleet.call<ChangedFile[]>('changes', card.id).catch(() => [] as ChangedFile[]);
+  if (files.length && !window.confirm(`${files.length} changed file${files.length === 1 ? ' hasn\'t' : 's haven\'t'} been merged into your project and will be lost. Archive anyway?`)) return;
   await window.fleet.call('archive', card.id);
 }
 
 export function DetailPanel() {
   const selectedId = useStore((s) => s.selectedId);
   const card = useStore((s) => s.snapshot.cards.find((c) => c.id === s.selectedId && !c.archived));
-  const [tab, setTab] = useState<'chat' | 'changes' | 'log'>('chat');
+  const [tab, setTab] = useState<'chat' | 'files' | 'log'>('chat');
+  const messagesOnly = useStore((s) => s.messagesOnly);
   useEffect(() => { setTab('chat'); }, [selectedId]);
   if (!card) return <aside className="detail detail-empty"><p>Select a card to see its output.</p></aside>;
   const live = isLive(card);
   return (
     <aside className={`detail s-${card.status}`}>
       <header className="detail-head">
-        <div className="detail-title"><span className="card-num">{pad2(card.index)}</span> {card.title}<span className="card-status">{STATUS_LABEL[card.status]}</span></div>
+        <div className="detail-title">{!card.isMaster && <span className="card-num">{pad2(card.index)}</span>} {card.title}{!card.isMaster && <span className="card-status">{stageLabel(card)}</span>}</div>
         <div className="detail-sub">
           <span>{modelLabel(card.model)} @{card.effort}</span>
           <span>{getState().snapshot.machines.find((m) => m.info.id === card.nodeId)?.info.name}</span>
@@ -376,16 +416,25 @@ export function DetailPanel() {
           <span className="detail-actions">
             {live && <button className="link-btn" onClick={() => void window.fleet.call('interrupt', card.id)}>Interrupt <kbd>Esc</kbd></button>}
             {card.slot && !['cold', 'syncing', 'empty', 'crashed'].includes(card.slot.state) && <button className="link-btn" onClick={() => void window.fleet.call('stopInstance', card.id)}>Stop editor</button>}
-            {live && <button className="link-btn" onClick={() => void window.fleet.call('stopAgent', card.id)}>Stop</button>}
-            {!live && <button className="link-btn" onClick={() => void archive(card)}>Archive</button>}
+            {live && !card.isMaster && <button className="link-btn" onClick={() => void window.fleet.call('stopAgent', card.id)}>Stop</button>}
+            {!live && !card.isMaster && <button className="link-btn" onClick={() => void archive(card)}>Archive</button>}
           </span>
         </div>
-        <nav className="tabs" role="tablist">
-          {(['chat', 'changes', 'log'] as const).map((t) => <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>{t === 'chat' ? 'Chat' : t === 'changes' ? 'Changes' : 'Editor log'}</button>)}
-        </nav>
+        <div className="tabs-row">
+          <nav className="tabs" role="tablist">
+            {(card.isMaster ? ['chat'] as const : ['chat', 'files', 'log'] as const).map((t) => <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>{t === 'chat' ? 'Chat' : t === 'files' ? 'Files' : 'Editor log'}</button>)}
+          </nav>
+          {tab === 'chat' && (
+            <label className="chat-filter" title="Hides tool calls, thinking and status notes. A prompt waiting on you and an error that stopped the agent still show.">
+              <input type="checkbox" checked={messagesOnly} onChange={(e) => setMessagesOnly(e.target.checked)} data-messages-only />
+              Messages only
+            </label>
+          )}
+        </div>
       </header>
-      {tab === 'chat' && <Transcript card={card} onChanges={() => setTab('changes')} />}
-      {tab === 'changes' && <ChangesTab card={card} />}
+      {!card.isMaster && <FlowPanel card={card} />}
+      {tab === 'chat' && <Transcript card={card} />}
+      {tab === 'files' && <FilesTab card={card} />}
       {tab === 'log' && <LogTab card={card} />}
       <Composer card={card} />
     </aside>

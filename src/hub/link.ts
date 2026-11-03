@@ -12,6 +12,8 @@ import { encodePairCode } from '../shared/pair';
 import type { LinkFrame, NodeEvent, NodeInfo } from '../shared/protocol';
 
 export const fingerprintOf = (certPem: string) => crypto.createHash('sha256').update(new crypto.X509Certificate(certPem).raw).digest('hex');
+export const LOCAL_HOST_ID = 'master';
+const PORT_WAIT_MS = 4000;
 
 function lanAddresses(): string[] {
   const out: string[] = [];
@@ -111,16 +113,32 @@ export class LinkServer extends EventEmitter {
     // ws re-emits the server's errors; port conflicts are handled by tryListen below.
     wss.on('error', () => {});
     this.server = server;
+    // Hosts were paired with this port, so a restart gets a moment for the old app to let go of it.
+    const started = Date.now();
     await new Promise<void>((resolve) => {
       const tryListen = (port: number, left: number) => {
         server.once('error', (e: any) => {
-          if (e.code === 'EADDRINUSE' && left > 0) tryListen(port + 1, left - 1);
+          if (e.code !== 'EADDRINUSE') { console.error('Link server failed to start:', e); resolve(); }
+          else if (Date.now() - started < PORT_WAIT_MS && port === this.port) setTimeout(() => tryListen(port, left), 300);
+          else if (left > 0) tryListen(port + 1, left - 1);
           else { console.error('Link server failed to start:', e); resolve(); }
         });
         server.listen(port, '0.0.0.0', () => { this.port = port; resolve(); });
       };
       tryListen(this.port, 10);
     });
+  }
+
+  // The master's own host links like any other, without a pairing code.
+  localHostConfig(masterName: string) {
+    this.state.hosts[LOCAL_HOST_ID] ??= { key: crypto.randomBytes(24).toString('base64url'), name: masterName };
+    this.save();
+    return {
+      hostId: LOCAL_HOST_ID,
+      key: this.state.hosts[LOCAL_HOST_ID].key,
+      masterName,
+      pair: { a: ['127.0.0.1'], p: this.port, t: this.state.pairToken, f: fingerprintOf(this.state.certPem) },
+    };
   }
 
   pairing() {
@@ -176,7 +194,7 @@ export class LinkServer extends EventEmitter {
     });
   }
 
-  stop() { this.server?.close(); for (const n of this.nodes.values()) n.ws?.close(); }
+  stop() { return new Promise<void>((resolve) => { for (const n of this.nodes.values()) n.ws?.terminate(); if (this.server) this.server.close(() => resolve()); else resolve(); setTimeout(resolve, 1000); }); }
 }
 
 function safeEqual(a: string, b: string) {

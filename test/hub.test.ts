@@ -60,6 +60,20 @@ test('a task only the agent can verify finishes with no popup and no test list',
   assert.ok(hub.transcript(id).some((t) => t.kind === 'system' && t.text.includes('Checked by the agent')));
 });
 
+test('progress keeps to whole percentages, and only finishing can fill it', async () => {
+  const hub = makeHub();
+  const id = await hub.createAgent(task('long'));
+  await until(() => cardOf(hub, id).progress != null, 'the first report');
+  await hub.stopAgent(id);
+  const report = (percent: number) => (hub as any).reduce((hub as any).agents.get(id), { k: 'progress', percent });
+  report(42.6);
+  assert.equal(cardOf(hub, id).progress, 43);
+  report(100);
+  assert.equal(cardOf(hub, id).progress, 99);
+  report(-5);
+  assert.equal(cardOf(hub, id).progress, 0);
+});
+
 test('a task needing human testing shows a final message, popup, and test list entries', async () => {
   const hub = makeHub();
   const attention: AgentCard[] = [];
@@ -71,7 +85,7 @@ test('a task needing human testing shows a final message, popup, and test list e
   const final = hub.transcript(id).find((t) => t.kind === 'final');
   assert.ok(final);
   hub.dismissAttention(id);
-  assert.equal(cardOf(hub, id).attention, null);
+  assert.equal(cardOf(hub, id).attention?.kind, 'testing', 'looking at a checklist does not settle it');
   assert.equal(cardOf(hub, id).status, 'finished');
 });
 

@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { EFFORTS, INSTANCE_MODES, MODELS, PERMISSION_MODES, type AgentCard, type ImageAttachment, type InstanceMode, type NewTask } from '../shared/protocol';
+import { EFFORTS, INSTANCE_MODES, MASTER_CHAT_ID, MODELS, PERMISSION_MODES, type AgentCard, type ImageAttachment, type InstanceMode, type NewTask } from '../shared/protocol';
 import { isLive } from './Cards';
-import { attentionQueue, dismissPopup, fmtAgo, getState, pad2, select, setState, useStore } from './store';
+import { attentionQueue, dismissPopup, fmtAgo, getState, goToNextTest, pad2, select, setState, useStore } from './store';
 
 const KIND_LABEL: Record<string, string> = {
-  permission: 'Needs permission', question: 'Has a question', reply: 'Waiting on you', crash: 'Unreal crashed', testing: 'Finished', error: 'Hit an error',
+  permission: 'Needs permission', question: 'Has a question', reply: 'Waiting on you', crash: 'Unreal crashed', testing: 'Ready to test', error: 'Hit an error',
 };
 
 export function AttentionPopup() {
@@ -21,7 +21,7 @@ export function AttentionPopup() {
           <div className="popup-kind">All tasks finished</div>
           <div className="popup-text">{allDone.count} thing{allDone.count === 1 ? '' : 's'} left to test by hand.</div>
         </div>
-        <div className="popup-keys"><span><kbd className="tab-key">Tab</kbd> Open list</span><span><kbd>Esc</kbd> Dismiss</span></div>
+        <div className="popup-keys"><span><kbd className="tab-key">Tab</kbd> Go there</span><span><kbd>Esc</kbd> Dismiss</span></div>
       </div>
     );
   }
@@ -51,7 +51,8 @@ export function handlePopupKey(e: KeyboardEvent): boolean {
     }
     if (s.allDone) {
       e.preventDefault();
-      setState({ allDone: null, modal: 'tests' });
+      setState({ allDone: null });
+      goToNextTest();
       return true;
     }
   }
@@ -76,7 +77,7 @@ export function BroadcastOverlay() {
   useEffect(() => { if (open) ref.current?.focus(); }, [open]);
   useEffect(() => { if (threadRef.current) threadRef.current.scrollTop = threadRef.current.scrollHeight; }, [broadcasts, open]);
 
-  const present = cards.filter((c) => !c.archived);
+  const present = cards.filter((c) => !c.archived && !c.isMaster);
   // Finished agents aren't messaged unless asked for: it would restart them and spend tokens.
   const targets = present.filter((c) => (c.status === 'finished' || c.status === 'stopped' ? includeDone.has(c.id) : !excluded.has(c.id)));
   if (!open) return null;
@@ -161,7 +162,7 @@ export function relatedCards(prompt: string, cards: AgentCard[]): AgentCard[] {
     for (const w of words) n += title.has(w) ? 2 : rest.has(w) ? 1 : 0;
     return n;
   };
-  return cards.filter((c) => !c.archived).map((c) => [c, score(c)] as const).filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([c]) => c);
+  return cards.filter((c) => !c.archived && !c.isMaster).map((c) => [c, score(c)] as const).filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([c]) => c);
 }
 
 export function NewTaskModal() {
@@ -194,9 +195,9 @@ export function NewTaskModal() {
     const text = prompt.trim();
     if (!text) return;
     const task: NewTask = { prompt: text, images: images.length ? images : undefined, projectFile: snapshot.demo ? null : projectFile, nodeId, model, effort, permissionMode, instanceMode, demo: snapshot.demo ? demo : undefined };
-    void window.fleet.call<string>('createAgent', task).then((id) => {
-      if (!another) void select(id);
-    });
+    // Watching the master chat first means following along to the agent it starts.
+    if (!another) void select(MASTER_CHAT_ID);
+    void window.fleet.call<string>('request', task);
     setPrompt('');
     setImages([]);
     if (another) ref.current?.focus();
@@ -232,7 +233,7 @@ export function NewTaskModal() {
           className="new-prompt"
           rows={5}
           value={prompt}
-          placeholder="What should this agent do? Paste screenshots here too."
+          placeholder="What needs doing? The master chat fetches any ticket it mentions and starts an agent on the best PC. Paste screenshots here too."
           onChange={(e) => setPrompt(e.target.value)}
           onPaste={(e) => { for (const it of e.clipboardData.items) { const f = it.getAsFile(); if (f) addImage(f); } }}
           onKeyDown={(e) => {
@@ -275,7 +276,7 @@ export function NewTaskModal() {
           </label>
           <label>Machine
             <select value={nodeId} onChange={(e) => setNodeId(e.target.value)}>
-              <option value="auto">Least busy</option>
+              <option value="auto">Automatic: another PC if one is free</option>
               {snapshot.machines.filter((m) => m.online).map((m) => <option key={m.info.id} value={m.info.id}>{m.info.name}</option>)}
             </select>
           </label>
@@ -342,6 +343,8 @@ export function MachinesModal() {
                 <div className="machine-name"><span className={m.online ? 'mach-on' : 'mach-off'}>◆</span> {m.info.name} <small>{m.info.role === 'master' ? 'this PC' : m.online ? 'connected' : 'offline'}</small></div>
                 <div className="machine-spec">{m.info.threads} threads · {m.info.ramGb} GB RAM · {m.info.vramGb} GB VRAM · UE {m.info.engines.map((e) => e.version).join(', ') || 'none'}{!m.info.claudePath && <b className="final-warn"> · Claude Code not found</b>}</div>
                 {m.info.unusableEngines?.map((u) => <div key={u.root} className="machine-spec">Not usable: {u.root}: {u.reason}</div>)}
+                {m.update?.stage === 'waiting' && <div className="machine-spec">A new host version is ready, and installs once {m.update.busy} running agent{m.update.busy === 1 ? ' finishes' : 's finish'}. <button className="link-btn" onClick={() => void window.fleet.call('restartHost', m.info.id)} data-restart-host>Restart now</button>, and they'll carry on afterwards.</div>}
+                {m.update?.stage === 'failed' && <div className="machine-spec final-warn">Couldn't update its host: {m.update.detail}</div>}
                 <div className="machine-ctl">
                   <label>Editors at once
                     <input type="number" min={1} max={32} value={m.info.maxInstances} onChange={(e) => void window.fleet.call('setMaxInstances', m.info.id, Number(e.target.value))} />
@@ -357,63 +360,3 @@ export function MachinesModal() {
   );
 }
 
-interface BatchApply { agentId: string; title: string; applied: number; conflicts: { path: string; reason: string }[]; error?: string }
-
-export function TestsModal() {
-  const open = useStore((s) => s.modal === 'tests');
-  const tests = useStore((s) => s.snapshot.testList);
-  const cards = useStore((s) => s.snapshot.cards);
-  const [batch, setBatch] = useState<BatchApply[] | null>(null);
-  const [busy, setBusy] = useState(false);
-  useEffect(() => { if (open) setBatch(null); }, [open]);
-  if (!open) return null;
-  const groups = new Map<string, typeof tests>();
-  for (const t of tests) groups.set(t.agentId, [...(groups.get(t.agentId) ?? []), t]);
-  const open_ = tests.filter((t) => !t.done).length;
-  const canApply = cards.some((c) => !c.archived && c.project && !(c.slot?.shared && c.nodeId === 'master'));
-  const applyAll = async () => {
-    setBusy(true);
-    try { setBatch(await window.fleet.call<BatchApply[]>('applyFinished')); } finally { setBusy(false); }
-  };
-  return (
-    <div className="overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) setState({ modal: null }); }}>
-      <div className="modal wide" role="dialog" aria-label="Needs testing" data-tests>
-        <div className="modal-head">
-          <h2>Needs testing</h2><span className="tests-count">{open_} left</span>
-          <span className="modal-hint">{canApply && <button className="btn small" disabled={busy} onClick={() => void applyAll()} data-apply-finished>{busy ? 'Applying…' : 'Apply all finished'}</button>} <kbd>Esc</kbd> Close</span>
-        </div>
-        {batch && (
-          <div className="apply-result" data-apply-report>
-            {batch.length === 0 && <p>No finished card has changes left to apply.</p>}
-            {batch.map((b) => (
-              <div key={b.agentId}>
-                <p>{b.title}: {b.error ?? `applied ${b.applied}`}{b.conflicts.length ? `, ${b.conflicts.length} not applied` : ''}</p>
-                {b.conflicts.length > 0 && <ul className="change-list">{b.conflicts.map((c) => <li key={c.path}><span className="chg-path">{c.path}</span><small>{c.reason}</small></li>)}</ul>}
-              </div>
-            ))}
-          </div>
-        )}
-        {tests.length === 0 && <p className="tab-empty">Nothing to test. Finished agents checked their own work.</p>}
-        {[...groups].map(([agentId, items]) => {
-          const c = cards.find((x) => x.id === agentId);
-          return (
-            <section key={agentId} className="test-group">
-              <h3><button className="link-btn" onClick={() => { setState({ modal: null }); void select(agentId); }}>{c ? `${pad2(c.index)} ${c.title}` : agentId}</button></h3>
-              {c?.final && <p className="final-summary">{c.final.summary}</p>}
-              <ul className="final-tests">
-                {items.map((t) => (
-                  <li key={t.key} className={t.done ? 'done' : ''}>
-                    <label>
-                      <input type="checkbox" checked={t.done} onChange={(e) => void window.fleet.call('setTestDone', t.key, e.target.checked)} />
-                      <span><b>{t.test.what}</b>{t.test.how && <small>How: {t.test.how}</small>}{t.test.why && <small>Why you: {t.test.why}</small>}</span>
-                    </label>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
