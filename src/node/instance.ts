@@ -1,6 +1,7 @@
-// One Unreal instance per agent: its own project copy, its own editor process, its own MCP
-// port and PIE ports. Copies are cheap to keep, so they persist. Running editors are the
-// scarce resource and are capped per machine.
+// One Unreal instance per agent: its own editor process, its own MCP and PIE ports, and its own
+// Saved and Intermediate folders. Agents on a machine work from the same project files, unless the
+// project was sent from the master, where each gets a copy so its changes can be sent back.
+// Running editors are the scarce resource and are capped per machine.
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
@@ -8,7 +9,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import type { EngineInfo, InstanceMode, ProjectInfo, SlotInfo, SlotState } from '../shared/protocol';
 import { forgetCopiesFromRecents, readProjectSettings } from './machine';
-import { syncProject, type SyncProgress } from './projectSync';
+import { freeLoadedModules, seedAssetCache, seedSaves, syncProject, type SyncProgress } from './projectSync';
 
 const q = (s: string) => `"${s}"`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -16,7 +17,27 @@ const MCP_SECTION = '[/Script/ModelContextProtocolEngine.ModelContextProtocolSet
 const PIE_SECTION = '[/Script/UnrealEd.LevelEditorPlaySettings]';
 const LIVE_SECTION = '[/Script/LiveCoding.LiveCodingSettings]';
 const BOOT_TIMEOUT_MS = 20 * 60_000;
+// Long enough for an editor to have loaded its modules, which happens early in a boot.
+const BUILD_WAITS_FOR_BOOTS_MS = 2 * 60_000;
+const WAITING_FOR_BUILD = "Waiting for another agent's build";
 const OWNER_FILE = 'owner';
+const safeProjectName = (name: string) => name.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 16) || 'project';
+
+// Agents sharing a project folder share its build outputs too, so they compile one at a time and
+// nothing new starts loading modules until the compile is done.
+class BuildGate {
+  private tail: Promise<unknown> = Promise.resolve();
+  private turns = 0;
+  builtAt = 0;
+  get busy() { return this.turns > 0; }
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    this.turns++;
+    const turn = this.tail.then(fn).finally(() => { this.turns--; });
+    this.tail = turn.catch(() => {});
+    return turn;
+  }
+  async idle() { while (this.busy) await this.tail; }
+}
 
 export class Semaphore {
   private waiting: (() => void)[] = [];
@@ -82,7 +103,9 @@ export class Slot {
   private holdsToken = false;
   private games: ChildProcess[] = [];
   private idleTimer: NodeJS.Timeout | null = null;
+  private bootedAt = 0;
   lastCrash: string | null = null;
+  task?: string;
 
   constructor(
     public id: string,
@@ -91,18 +114,49 @@ export class Slot {
     public dir: string,
     public engine: EngineInfo | null,
     private mgr: SlotManager,
+    // What's this agent's alone. A copy holds it; beside a shared folder it lives elsewhere.
+    public own: string = dir,
   ) {
     this.mcp = new McpClient(`http://127.0.0.1:${this.port}/mcp`);
   }
 
+  get shared() { return this.own !== this.dir; }
   get port() { return this.mgr.basePort + this.index; }
   get piePort() { return 17800 + this.index * 10; }
   get projectFile() { return path.join(this.dir, path.basename(this.project.file)); }
-  get logFile() { return path.join(this.dir, '.fleet', 'editor.log'); }
+  get fleetDir() { return path.join(this.own, '.fleet'); }
+  get logFile() { return path.join(this.fleetDir, 'editor.log'); }
   get isRunning() { return !!this.proc && this.proc.exitCode === null; }
+  // Saved and Intermediate move here, which is what lets editors share a project folder.
+  private get userDirArgs() { return this.shared ? [`-UserDir=${q(this.own)}`] : []; }
+  private get gate() { return this.mgr.gate(this.project.dir); }
 
   info(): SlotInfo {
-    return { id: this.id, nodeId: this.mgr.nodeId, project: this.project.name, dir: this.dir, port: this.port, state: this.state, agentId: this.agentId, detail: this.detail, pid: this.pid, mode: this.mode, progress: this.progress };
+    return { id: this.id, nodeId: this.mgr.nodeId, project: this.project.name, dir: this.dir, own: this.own, shared: this.shared, port: this.port, state: this.state, agentId: this.agentId, detail: this.detail, pid: this.pid, mode: this.mode, progress: this.progress };
+  }
+
+  // When this agent claimed its place, which is where "changed since the task started" counts from.
+  startedAt() {
+    try { return fs.statSync(path.join(this.fleetDir, OWNER_FILE)).mtimeMs; } catch { return Date.now(); }
+  }
+
+  // Who else is in this folder, for the agent to see before it blames itself for their work.
+  sharing() {
+    if (!this.shared) return {};
+    return {
+      sharedFolder: true,
+      otherAgentsHere: this.mgr.sharingWith(this).map((s) => ({ task: s.task, editor: s.state })),
+      newerBuildThanYourEditor: this.isRunning && this.gate.builtAt > this.bootedAt,
+    };
+  }
+
+  // Waits out a build of this folder, then puts the state back for whatever comes next.
+  private async buildsDone() {
+    if (!this.shared || !this.gate.busy) return;
+    const { state, detail } = this;
+    this.setState('queued', WAITING_FOR_BUILD);
+    await this.gate.idle();
+    this.setState(state, detail);
   }
 
   setState(state: SlotState, detail?: string) {
@@ -112,6 +166,11 @@ export class Slot {
   }
 
   async sync() {
+    if (this.shared) {
+      await Promise.all([seedSaves(this.project.dir, this.own), seedAssetCache(this.project.dir, this.own)]);
+      this.setState('cold');
+      return;
+    }
     this.setState('syncing', 'Copying project');
     const fmt = (p: SyncProgress) => `${p.done.toLocaleString()} / ${p.total.toLocaleString()} files`;
     const stat = await syncProject(this.project.dir, this.dir, (p) => {
@@ -137,6 +196,7 @@ export class Slot {
       ...(settings.startupMap ? [settings.startupMap] : []),
       // No -nosound: audio features can't be tested without a running audio device. The engine
       // already outputs silence while unfocused, and these instances never have focus.
+      ...this.userDirArgs,
       `-AbsLog=${q(this.logFile)}`, '-log', '-nosplash', '-unattended', '-NoLiveCoding', '-AutoDeclinePackageRecovery',
       ...(hasMcp ? ['-EnablePlugins=ModelContextProtocol,AllToolsets'] : []),
       ...(mode === 'offscreen' ? ['-RenderOffscreen', '-ResX=1280', '-ResY=720'] : []),
@@ -165,12 +225,15 @@ export class Slot {
   private async boot() {
     await this.mgr.editors.acquire(() => this.setState('queued', 'Waiting for a free instance'));
     this.holdsToken = true;
+    await this.buildsDone();
     this.setState('booting', 'Starting editor');
+    await fsp.mkdir(this.fleetDir, { recursive: true });
     await fsp.rm(this.logFile, { force: true });
     const exe = path.join(this.engine!.root, 'Engine/Binaries/Win64/UnrealEditor.exe');
     const p = spawn(exe, this.editorArgs(this.mode), { argv0: q(exe), windowsVerbatimArguments: true, stdio: 'ignore', windowsHide: this.mode !== 'windowed' });
     this.proc = p;
     this.pid = p.pid;
+    this.bootedAt = Date.now();
     this.stopping = false;
     this.mcp = new McpClient(`http://127.0.0.1:${this.port}/mcp`);
     let exited = false;
@@ -232,18 +295,30 @@ export class Slot {
 
   async build(opts: { target?: string; config?: string; clean?: boolean }): Promise<{ ok: boolean; output: string; ms: number }> {
     if (!this.engine) throw new Error('No matching engine on this machine.');
-    const hadEditor = this.isRunning;
-    if (hadEditor) await this.stopEditor();
+    if (this.isRunning) await this.stopEditor();
+    if (!this.shared) return this.compile(opts);
+    if (this.gate.busy) this.setState('queued', WAITING_FOR_BUILD);
+    return this.gate.run(async () => {
+      await this.mgr.bootsSettled(this);
+      await freeLoadedModules(this.project.dir);
+      const r = await this.compile(opts);
+      if (r.ok) this.gate.builtAt = Date.now();
+      return r;
+    });
+  }
+
+  private async compile(opts: { target?: string; config?: string; clean?: boolean }): Promise<{ ok: boolean; output: string; ms: number }> {
     await this.mgr.builds.acquire(() => this.setState('queued', 'Waiting for a build slot'));
     const t0 = Date.now();
     this.setState('building', opts.target ?? 'Editor');
     try {
-      const bat = path.join(this.engine.root, 'Engine/Build/BatchFiles', opts.clean ? 'Clean.bat' : 'Build.bat');
+      const bat = path.join(this.engine!.root, 'Engine/Build/BatchFiles', opts.clean ? 'Clean.bat' : 'Build.bat');
       const target = opts.target ?? `${path.basename(this.project.file, '.uproject')}Editor`;
       const share = Math.max(2, Math.floor(this.mgr.threads / Math.max(1, this.mgr.builds.inUse)));
       // UBT's mutex is per engine, not per project. Each copy has its own Intermediate, so it's safe
-      // to skip, as long as nothing relinks a source engine's DLLs under every running editor.
-      const args = [target, 'Win64', opts.config ?? 'Development', `-Project=${q(this.projectFile)}`, '-NoMutex', `-MaxParallelActions=${share}`, '-NoHotReload', ...(this.engine.source ? ['-NoEngineChanges'] : [])];
+      // to skip, as long as nothing relinks a source engine's DLLs under every running editor. A
+      // shared folder keeps it, so this waits for a build the user started from Visual Studio.
+      const args = [target, 'Win64', opts.config ?? 'Development', `-Project=${q(this.projectFile)}`, this.shared ? '-WaitMutex' : '-NoMutex', `-MaxParallelActions=${share}`, '-NoHotReload', ...(this.engine!.source ? ['-NoEngineChanges'] : [])];
       const out = await runCaptured(bat, args, this.dir);
       const ok = out.code === 0;
       this.setState('cold');
@@ -260,13 +335,14 @@ export class Slot {
     // A running editor already holds this slot's place; waiting for another could wait on itself.
     const ownPlace = this.holdsToken;
     if (!ownPlace) await this.mgr.editors.acquire(() => this.setState('queued', 'Waiting for a free instance'));
+    await this.buildsDone();
     this.setState('testing', filter);
     try {
       const exe = path.join(this.engine.root, 'Engine/Binaries/Win64/UnrealEditor-Cmd.exe');
-      const reportDir = path.join(this.dir, '.fleet', 'test-report');
+      const reportDir = path.join(this.fleetDir, 'test-report');
       await fsp.rm(reportDir, { recursive: true, force: true });
       const args = [
-        q(this.projectFile), '-unattended', '-nosplash', render ? '-RenderOffscreen' : '-nullrhi', '-stdout', '-FullStdOutLogOutput',
+        q(this.projectFile), ...this.userDirArgs, '-unattended', '-nosplash', render ? '-RenderOffscreen' : '-nullrhi', '-stdout', '-FullStdOutLogOutput',
         `-ExecCmds=${q(`Automation RunTests ${filter};Quit`)}`, `-ReportExportPath=${q(reportDir)}`, '-TestExit=Automation Test Queue Empty',
       ];
       const out = await runCaptured(exe, args, this.dir);
@@ -281,13 +357,14 @@ export class Slot {
   // Standalone game processes, for testing real networking between separate clients.
   async launchGame(opts: { map?: string; extraArgs?: string; count?: number; server?: boolean }) {
     if (!this.engine) throw new Error('No matching engine on this machine.');
+    await this.buildsDone();
     const exe = path.join(this.engine.root, 'Engine/Binaries/Win64/UnrealEditor.exe');
     const started: { pid?: number; log: string; role: string }[] = [];
     const count = Math.min(opts.count ?? 1, 4);
     const launchOne = (role: string, url: string, i: number) => {
-      const log = path.join(this.dir, '.fleet', `game-${role}-${i}.log`);
+      const log = path.join(this.fleetDir, `game-${role}-${i}.log`);
       const settings = readProjectSettings(this.project.dir);
-      const args = [q(this.projectFile), url, '-game', `-AbsLog=${q(log)}`, '-log', '-nosplash', '-unattended', '-RenderOffscreen', '-ResX=640', '-ResY=360', ...(settings.gameArgs ? [settings.gameArgs] : []), ...(opts.extraArgs ? [opts.extraArgs] : [])];
+      const args = [q(this.projectFile), url, '-game', ...this.userDirArgs, `-AbsLog=${q(log)}`, '-log', '-nosplash', '-unattended', '-RenderOffscreen', '-ResX=640', '-ResY=360', ...(settings.gameArgs ? [settings.gameArgs] : []), ...(opts.extraArgs ? [opts.extraArgs] : [])];
       const p = spawn(exe, args, { argv0: q(exe), windowsVerbatimArguments: true, stdio: 'ignore', windowsHide: true });
       this.games.push(p);
       started.push({ pid: p.pid, log, role });
@@ -303,7 +380,7 @@ export class Slot {
   }
 
   async crashInfo(): Promise<string> {
-    const dir = path.join(this.dir, 'Saved', 'Crashes');
+    const dir = path.join(this.own, 'Saved', 'Crashes');
     let newest: string | null = null;
     let newestAt = 0;
     for (const e of await fsp.readdir(dir, { withFileTypes: true }).catch(() => [] as fs.Dirent[])) {
@@ -352,6 +429,7 @@ export class SlotManager extends EventEmitter {
   basePort = 8300;
   idleStopMs = 10 * 60_000;
   private slots = new Map<string, Slot>();
+  private gates = new Map<string, BuildGate>();
   private claiming: Promise<unknown> = Promise.resolve();
 
   constructor(public nodeId: string, private dataRoot: string, public threads: number, maxInstances: number) {
@@ -363,6 +441,24 @@ export class SlotManager extends EventEmitter {
   setMaxInstances(n: number) { this.editors.limit = n; }
   list(): SlotInfo[] { return [...this.slots.values()].map((s) => s.info()); }
   changed(_s: Slot) { this.emit('changed'); }
+
+  gate(projectDir: string) {
+    const key = projectDir.toLowerCase();
+    let g = this.gates.get(key);
+    if (!g) { g = new BuildGate(); this.gates.set(key, g); }
+    return g;
+  }
+
+  sharingWith(slot: Slot) {
+    const key = slot.project.dir.toLowerCase();
+    return [...this.slots.values()].filter((s) => s !== slot && s.shared && s.project.dir.toLowerCase() === key);
+  }
+
+  // An editor part way through loading modules could pick up one mid-link.
+  async bootsSettled(slot: Slot) {
+    const end = Date.now() + BUILD_WAITS_FOR_BOOTS_MS;
+    while (Date.now() < end && this.sharingWith(slot).some((s) => s.state === 'booting')) await sleep(1000);
+  }
 
   // Copies have to live on the project's drive for hardlinks to work.
   private slotsRoot(project: ProjectInfo) {
@@ -388,9 +484,13 @@ export class SlotManager extends EventEmitter {
   }
 
   private async claimSlot(project: ProjectInfo, engine: EngineInfo | null, agentId: string, mode: InstanceMode): Promise<Slot> {
-    const safeName = project.name.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 16) || 'project';
-    const root = path.join(this.slotsRoot(project), safeName);
-    // Reuse a free copy on disk: its Intermediate and Binaries make the next build incremental.
+    const safeName = safeProjectName(project.name);
+    // A project sent from the master has to get each agent's changes back to it, and sending it again
+    // would overwrite the folder, so that's the one case where agents can't share.
+    const shared = !project.received;
+    const root = shared ? path.join(this.dataRoot, 'u', safeName) : path.join(this.slotsRoot(project), safeName);
+    // Reuse a free folder on disk. In a copy, its Intermediate and Binaries make the next build
+    // incremental. Beside a shared folder, its asset registry cache makes the next boot quicker.
     // The owner file survives restarts, so a copy with unapplied work is never picked up and wiped.
     const names = await fsp.readdir(root).catch(() => [] as string[]);
     let reuse: string | null = null;
@@ -406,7 +506,7 @@ export class SlotManager extends EventEmitter {
     }
     await fsp.mkdir(path.join(dir, '.fleet'), { recursive: true });
     await fsp.writeFile(path.join(dir, '.fleet', OWNER_FILE), agentId);
-    const slot = new Slot(`${safeName}-${path.basename(dir)}`, index, project, dir, engine, this);
+    const slot = new Slot(`${safeName}-${path.basename(dir)}`, index, project, shared ? project.dir : dir, engine, this, dir);
     slot.agentId = agentId;
     slot.mode = mode;
     this.slots.set(agentId, slot);
@@ -414,9 +514,11 @@ export class SlotManager extends EventEmitter {
     return slot;
   }
 
-  // Re-attach to an existing copy (app restart) without touching what the agent changed.
+  // Re-attach (app restart) without touching what the agent changed. A copy holds the project file;
+  // anything else is an agent's own folder beside a shared project.
   adopt(project: ProjectInfo, engine: EngineInfo | null, agentId: string, dir: string, mode: InstanceMode): Slot {
-    const slot = new Slot(`${project.name.slice(0, 16)}-${path.basename(dir)}`, this.nextIndex(), project, dir, engine, this);
+    const isCopy = fs.existsSync(path.join(dir, path.basename(project.file)));
+    const slot = new Slot(`${project.name.slice(0, 16)}-${path.basename(dir)}`, this.nextIndex(), project, isCopy ? dir : project.dir, engine, this, dir);
     slot.agentId = agentId;
     slot.mode = mode;
     slot.state = 'cold';
@@ -427,13 +529,35 @@ export class SlotManager extends EventEmitter {
 
   get(agentId: string) { return this.slots.get(agentId); }
 
-  async release(agentId: string) {
+  // A card restored after a restart has no live slot until it's messaged, so its folder is named
+  // here instead. The owner file has to agree, so this can't free a folder belonging to anyone else.
+  async release(agentId: string, dir?: string) {
     const s = this.slots.get(agentId);
-    if (!s) return;
-    await s.stopEditor();
-    await fsp.rm(path.join(s.dir, '.fleet', OWNER_FILE), { force: true });
-    this.slots.delete(agentId);
-    this.emit('changed');
+    if (s) {
+      await s.stopEditor();
+      this.slots.delete(agentId);
+      this.emit('changed');
+    }
+    const own = s?.own ?? dir;
+    if (!own) return;
+    const owner = path.join(own, '.fleet', OWNER_FILE);
+    if (await fsp.readFile(owner, 'utf8').then((id) => id === agentId, () => false)) await fsp.rm(owner, { force: true });
+  }
+
+  // Copies are only for projects sent here now. Any others are left from before, and a free one
+  // holds nothing that isn't in the project, so all they do is take up disk.
+  async removeUnusedCopies(projects: ProjectInfo[]) {
+    const keep = new Set(projects.filter((p) => p.received).map((p) => safeProjectName(p.name)));
+    const roots = new Set([path.join(this.dataRoot, 's'), ...projects.map((p) => this.slotsRoot(p))]);
+    for (const root of roots) {
+      for (const name of await fsp.readdir(root).catch(() => [] as string[])) {
+        if (keep.has(name)) continue;
+        for (const n of await fsp.readdir(path.join(root, name)).catch(() => [] as string[])) {
+          const dir = path.join(root, name, n);
+          if (/^\d+$/.test(n) && !fs.existsSync(path.join(dir, '.fleet', OWNER_FILE))) await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+        }
+      }
+    }
   }
 
   async shutdown() {

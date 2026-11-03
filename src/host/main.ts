@@ -5,16 +5,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline/promises';
 import WebSocket from 'ws';
-import { dataRoot, engineFromRoot, engineProblem, engineRootOf } from '../node/machine';
+import { dataRoot, engineFromRoot, engineProblem, engineRootOf, projectFileFrom } from '../node/machine';
 import { NodeService } from '../node/nodeService';
 import { decodePairCode, type PairCode } from '../shared/pair';
+import { keepAwake } from './keepAwake';
 import type { LinkFrame, NodeEvent } from '../shared/protocol';
 
 const VERSION = '1.0.0';
 const DATA = process.env.FLEET_HOST_DATA ?? dataRoot('uefleet-host');
 const CONFIG = path.join(DATA, 'config.json');
 
-interface Config { hostId: string; key?: string; pair?: PairCode; masterName?: string; engines?: string[] }
+interface Config { hostId: string; key?: string; pair?: PairCode; masterName?: string; engines?: string[]; projects?: string[] }
 
 function loadConfig(): Config {
   try { return JSON.parse(fs.readFileSync(CONFIG, 'utf8')); } catch { return { hostId: crypto.randomUUID() }; }
@@ -22,6 +23,11 @@ function loadConfig(): Config {
 function saveConfig(c: Config) {
   fs.mkdirSync(DATA, { recursive: true });
   fs.writeFileSync(CONFIG, JSON.stringify(c, null, 2));
+}
+// A running host shares this file with --engine and --project in another terminal, so it only
+// writes back what it owns.
+function saveLink(c: Config) {
+  saveConfig({ ...loadConfig(), key: c.key, pair: c.pair, masterName: c.masterName });
 }
 
 const stamp = () => new Date().toLocaleTimeString();
@@ -67,6 +73,27 @@ async function main() {
     console.log(`Removed ${root}. Close any running host and start it again.`);
     return;
   }
+  const projectArg = argValue('--project');
+  if (projectArg) {
+    const file = projectFileFrom(projectArg);
+    if (!file) {
+      console.log(`There's no .uproject at ${projectArg}.`);
+      process.exitCode = 1;
+      return;
+    }
+    cfg.projects = [file, ...(cfg.projects ?? []).filter((f) => f.toLowerCase() !== file.toLowerCase())];
+    saveConfig(cfg);
+    console.log(`New tasks on ${path.basename(file, '.uproject')} will use ${file}. A running host picks this up by itself.`);
+    return;
+  }
+  const unpinArg = argValue('--remove-project');
+  if (unpinArg) {
+    const file = (projectFileFrom(unpinArg) ?? path.resolve(unpinArg)).toLowerCase();
+    cfg.projects = (cfg.projects ?? []).filter((f) => f.toLowerCase() !== file);
+    saveConfig(cfg);
+    console.log(`Removed ${unpinArg}.`);
+    return;
+  }
   const codeArg = argValue('--pair');
   if (codeArg) { cfg.pair = decodePairCode(codeArg); delete cfg.key; }
   if (!cfg.pair) {
@@ -81,7 +108,7 @@ async function main() {
   }
   saveConfig(cfg);
 
-  const service = new NodeService({ id: cfg.hostId, role: 'remote', version: VERSION, dataDir: DATA, extraEngines: cfg.engines });
+  const service = new NodeService({ id: cfg.hostId, role: 'remote', version: VERSION, dataDir: DATA, extraEngines: cfg.engines, pinnedProjects: () => loadConfig().projects ?? [] });
   const info = service.info;
   console.log(`\nThis machine: ${info.name}, ${info.threads} threads, ${info.ramGb} GB RAM, ${info.vramGb} GB VRAM`);
   console.log(`Unreal: ${info.engines.length ? '' : 'none found'}`);
@@ -89,7 +116,10 @@ async function main() {
   for (const u of info.unusableEngines ?? []) console.log(`  Not usable: ${u.root}: ${u.reason}.`);
   console.log('  Editor missing? Run: fleet-host.exe --engine "<engine folder>"');
   console.log(`Claude: ${info.claudePath ?? 'NOT FOUND. Install Claude Code and sign in, or agents cannot run here.'}`);
+  console.log(`Projects already here: ${info.projects.filter((p) => !p.received).length}. To choose a copy: fleet-host.exe --project "<.uproject or its folder>"`);
+  for (const p of info.projects.filter((x) => !x.received).slice(0, 12)) console.log(`  ${p.name}  ${p.dir}`);
   console.log(`Up to ${info.maxInstances} editors at once.\n`);
+  keepAwake(log);
   connect(cfg, service);
 
   const quit = async () => { log('Shutting down.'); await service.shutdown(); process.exit(0); };
@@ -136,7 +166,7 @@ function connect(cfg: Config, service: NodeService) {
       if (f.f === 'welcome') {
         if (f.key) { cfg.key = f.key; }
         cfg.masterName = f.masterName;
-        saveConfig(cfg);
+        saveLink(cfg);
         backoff = 1000;
         log(`Connected to ${f.masterName} at ${addr}.`);
         forward = (ev) => { if (ws.readyState === 1) ws.send(JSON.stringify({ f: 'ev', ev } satisfies LinkFrame)); };
@@ -147,7 +177,7 @@ function connect(cfg: Config, service: NodeService) {
         log(f.reason);
         delete cfg.key;
         delete cfg.pair;
-        saveConfig(cfg);
+        saveLink(cfg);
         log('Run this app again with a new pairing code.');
         void holdOpen().then(() => process.exit(1));
       } else if (f.f === 'req') {

@@ -106,7 +106,7 @@ export function CardGrid() {
     return (
       <div className="empty">
         <h2>No tasks running</h2>
-        <p>Each task gets its own copy of the project and its own Unreal editor, so tasks never wait on each other.</p>
+        <p>Each task gets its own Unreal editor, and they all work from the project's own files.</p>
         <button className="btn primary" onClick={() => setState({ modal: 'new' })}>New task <kbd>Ctrl N</kbd></button>
       </div>
     );

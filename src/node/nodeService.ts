@@ -9,8 +9,8 @@ import { AgentRunner } from './agentRunner';
 import { DemoRunner } from './demoRunner';
 import { appendPrompt, FLEET_TOOLS, fleetServer } from './fleetTools';
 import { Slot, SlotManager } from './instance';
-import { describeMachine, projectMemoryDir, readProject, readProjectSettings, resolveEngine, statsSampler } from './machine';
-import { applyChanges, baseText, buildManifest, listChanges, planReceive, readChunk, writeChunk, type ManifestEntry } from './projectSync';
+import { describeMachine, discoverProjects, projectMemoryDir, readProject, readProjectSettings, resolveEngine, statsSampler } from './machine';
+import { applyChanges, baseText, buildManifest, changedSince, listChanges, planReceive, readChunk, writeChunk, type ManifestEntry } from './projectSync';
 
 interface Live {
   runner: AgentRunner | DemoRunner;
@@ -30,10 +30,12 @@ export class NodeService extends EventEmitter {
   private timers: NodeJS.Timeout[] = [];
   private slotDirty = false;
 
-  constructor(private opts: { id: string; role: NodeInfo['role']; version: string; dataDir: string; extraProjects?: ProjectInfo[]; extraEngines?: string[] }) {
+  constructor(private opts: { id: string; role: NodeInfo['role']; version: string; dataDir: string; pinnedProjects?: () => string[]; extraEngines?: string[] }) {
     super();
-    this.info = describeMachine(opts.id, opts.role, opts.version, [...(opts.extraProjects ?? []), ...this.receivedProjects()], opts.extraEngines);
+    this.info = describeMachine(opts.id, opts.role, opts.version, this.receivedProjects(), opts.extraEngines);
+    if (opts.pinnedProjects) this.refreshProjects();
     this.slots = new SlotManager(opts.id, opts.dataDir, this.info.threads, this.info.maxInstances);
+    void this.slots.removeUnusedCopies(this.info.projects);
     this.slots.on('changed', () => { this.slotDirty = true; });
     this.timers.push(setInterval(() => {
       if (!this.slotDirty) return;
@@ -64,6 +66,23 @@ export class NodeService extends EventEmitter {
       for (const e of a.log) if (e.seq > from) this.out({ t: 'agent', agentId, seq: e.seq, ev: e.ev });
     }
     this.out({ t: 'slots', slots: this.slots.list() });
+  }
+
+  // Projects come and go while this runs: one gets opened in Unreal, a workspace gets created, or
+  // --project is run in another terminal. Pinned ones come first, since someone chose them.
+  refreshProjects(): ProjectInfo[] {
+    const engines = this.info.engines;
+    const pinned = (this.opts.pinnedProjects?.() ?? []).map((f) => readProject(f, engines)).filter((p): p is ProjectInfo => !!p);
+    const merged = new Map<string, ProjectInfo>();
+    for (const p of [...pinned, ...discoverProjects(engines), ...this.info.projects]) {
+      if (!fs.existsSync(p.file)) continue;
+      const key = p.file.toLowerCase();
+      const had = merged.get(key);
+      if (had) had.received ||= p.received;
+      else merged.set(key, { ...p });
+    }
+    this.info.projects = [...merged.values()];
+    return this.info.projects;
   }
 
   addProject(file: string): ProjectInfo | null {
@@ -113,7 +132,9 @@ export class NodeService extends EventEmitter {
         const pending = this.slots.acquire(project, engine, spawn.id, spawn.instanceMode);
         const t = setInterval(() => { const s = this.slots.get(spawn.id); if (s) emit({ k: 'instance', slot: s.info() }); }, 500);
         try { live.slot = await pending; } finally { clearInterval(t); }
+        if (live.slot.shared) emit({ k: 'item', item: { kind: 'system', id: `shared-${spawn.id}`, at: Date.now(), text: `Working in your project folder: ${project.dir}. What it saves is in your workspace straight away, and other agents on ${this.info.name} see it too.` } });
       }
+      live.slot.task = spawn.title;
       cwd = live.slot.dir;
       emit({ k: 'instance', slot: live.slot.info() });
     } else {
@@ -156,13 +177,14 @@ export class NodeService extends EventEmitter {
   answer(agentId: string, itemId: string, answers: Record<string, string>) { this.need(agentId).runner.answer(itemId, answers); }
   interrupt(agentId: string) { return this.need(agentId).runner.interrupt(); }
 
-  async stop(agentId: string, releaseSlot = false) {
+  async stop(agentId: string, releaseSlot = false, slotDir?: string) {
     const a = this.agents.get(agentId);
-    if (!a) return;
-    a.runner?.stop();
-    await a.slot?.stopEditor();
+    a?.runner?.stop();
+    await a?.slot?.stopEditor();
     this.agents.delete(agentId);
-    if (releaseSlot) await this.slots.release(agentId);
+    if (!releaseSlot) return;
+    await this.slots.release(agentId, slotDir);
+    void this.slots.removeUnusedCopies(this.info.projects);
   }
 
   async changes(agentId: string): Promise<ChangedFile[]> {
@@ -170,22 +192,24 @@ export class NodeService extends EventEmitter {
     if (!a.slot) return [];
     const never = readProjectSettings(a.slot.project.dir).neverApply ?? [];
     const norm = (p: string) => p.replaceAll('\\', '/').toLowerCase();
-    return (await listChanges(a.slot.dir)).map((c) => ({ ...c, usuallySkipped: never.some((n) => norm(c.path) === norm(n)) }));
+    const list = a.slot.shared ? await changedSince(a.slot.dir, a.slot.startedAt()) : await listChanges(a.slot.dir);
+    return list.map((c) => ({ ...c, usuallySkipped: never.some((n) => norm(c.path) === norm(n)) }));
   }
   async apply(agentId: string, only?: string[], force?: string[]): Promise<ApplyResult> {
     const a = this.need(agentId);
-    if (!a.slot) return { applied: [], merged: [], conflicts: [] };
+    // Work in a shared folder is already in the project.
+    if (!a.slot || a.slot.shared) return { applied: [], merged: [], conflicts: [] };
     return applyChanges(a.slot.dir, a.slot.project.dir, only, force);
   }
   async readAgentFile(agentId: string, rel: string, offset: number) {
     const a = this.need(agentId);
-    if (!a.slot) throw new Error('No project copy.');
+    if (!a.slot) throw new Error('No project on this task.');
     return readChunk(path.join(a.slot.dir, rel), offset);
   }
   // Base64, because this crosses the machine link as JSON and has to arrive byte for byte.
   async agentBaseText(agentId: string, rel: string) {
     const a = this.need(agentId);
-    const base = a.slot ? await baseText(a.slot.dir, rel) : null;
+    const base = a.slot && !a.slot.shared ? await baseText(a.slot.dir, rel) : null;
     return base ? base.toString('base64') : null;
   }
   async logTail(agentId: string, lines: number) {
@@ -236,7 +260,7 @@ export class NodeService extends EventEmitter {
       case 'agent.decide': return this.decide(p.agentId, p.itemId, p.decision);
       case 'agent.answer': return this.answer(p.agentId, p.itemId, p.answers);
       case 'agent.interrupt': return this.interrupt(p.agentId);
-      case 'agent.stop': return this.stop(p.agentId, p.releaseSlot);
+      case 'agent.stop': return this.stop(p.agentId, p.releaseSlot, p.slotDir);
       case 'agent.has': return this.has(p.agentId);
       case 'agent.changes': return this.changes(p.agentId);
       case 'agent.apply': return this.apply(p.agentId, p.only, p.force);
@@ -248,6 +272,7 @@ export class NodeService extends EventEmitter {
       case 'project.put': return this.projectPut(p.name, p.path, p.offset, p.data, p.last, p.mtime);
       case 'project.done': return this.projectDone(p.name, p.uproject);
       case 'machine.info': return this.info;
+      case 'machine.refreshProjects': return this.refreshProjects();
       case 'machine.setMaxInstances': this.info.maxInstances = p.n; this.slots.setMaxInstances(p.n); return this.info;
       default: throw new Error(`Unknown method ${method}`);
     }

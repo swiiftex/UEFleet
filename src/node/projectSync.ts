@@ -1,4 +1,5 @@
-// Fast per-agent project copies with no dependency on the project's version control.
+// Most agents work directly in the project folder, and this holds what that needs. A project sent
+// from the master gets fast per-agent copies instead, with no dependency on version control.
 // Content is hardlinked (UE saves by replacing the file, so a save in one copy can't leak
 // into another); everything an agent can edit in place is a real copy.
 import { execFile } from 'node:child_process';
@@ -21,7 +22,8 @@ const SKIP_ANYWHERE = new Set(['.git', '.plastic', '.svn']);
 const SKIP_EXT = new Set(['.sln', '.slnx', '.suo', '.dotsettings', '.user', '.vcxproj', '.filters']);
 const BINARY_EXT = /\.(uasset|umap|ubulk|uexp|upk|png|jpe?g|tga|exr|hdr|bmp|dds|psd|fbx|obj|wav|wem|bnk|mp3|ogg|mp4|mov|dll|so|dylib|exe|pdb|lib|a|prx|prof|exp|bin|pak|zip|7z|gz|ttf|otf)$/i;
 // Always a real copy, however large, because agents edit these in place.
-const TEXT_EXT = /\.(cpp|cc|c|h|hpp|inl|cs|py|ini|json|txt|md|uplugin|uproject|xml|ya?ml|usf|ush|hlsl|js|ts|bat|cmd|sh|ps1|toml|csv|tsv|html|css)$/i;
+const TEXT_EXTENSIONS = ['cpp', 'cc', 'c', 'h', 'hpp', 'inl', 'cs', 'py', 'ini', 'json', 'txt', 'md', 'uplugin', 'uproject', 'xml', 'yml', 'yaml', 'usf', 'ush', 'hlsl', 'js', 'ts', 'bat', 'cmd', 'sh', 'ps1', 'toml', 'csv', 'tsv', 'html', 'css', 'm', 'mm', 'java', 'kt', 'gradle', 'lua', 'cfg', 'natvis', 'rc', 'def', 'plist'];
+const TEXT_EXT = new RegExp(`\\.(${TEXT_EXTENSIONS.join('|')})$`, 'i');
 const LINK_ABOVE_BYTES = 4 * 1024 * 1024;
 
 export const isBinaryPath = (rel: string) => BINARY_EXT.test(rel);
@@ -129,7 +131,7 @@ export async function syncProject(src: string, dst: string, onProgress?: (p: Syn
 
 // Agents start from the user's real progress and settings instead of a fresh first run. Saved/ is
 // never listed as a change, so nothing an agent does to these can reach the real saves.
-async function seedSaves(src: string, dst: string) {
+export async function seedSaves(src: string, dst: string) {
   const from = path.join(src, 'Saved', 'SaveGames');
   if (!fs.existsSync(from)) return;
   await fsp.rm(path.join(dst, 'Saved', 'SaveGames'), { recursive: true, force: true });
@@ -140,25 +142,43 @@ async function readBaseline(slotDir: string): Promise<Baseline> {
   try { return JSON.parse(await fsp.readFile(baselinePath(slotDir), 'utf8')); } catch { return {}; }
 }
 
+// Only text is tracked. Plugins can ship gigabytes of libraries, Wwise for one, and none of them
+// could be merged anyway. The last matching line wins, so the plugin folders stay out.
 const GIT_EXCLUDE = `/*
 !/Source/
 !/Config/
-!/*.uproject
-!/CLAUDE.md
 !/Plugins/
+/Source/**
+/Config/**
+/Plugins/**
+!/Source/**/
+!/Config/**/
+!/Plugins/**/
+${TEXT_EXTENSIONS.map((e) => `!*.${e}`).join('\n')}
+!/CLAUDE.md
 /Plugins/*/Content/
 /Plugins/*/Binaries/
 /Plugins/*/Intermediate/
 /.fleet/
 `;
 
+// Marks a repo made with the rules above. One without it may hold those libraries.
+const TEXT_ONLY_MARKER = 'fleet-text-only';
+
 // A private repo over the text files gives the agent normal git tools and gives us a merge base.
 async function snapshotText(slotDir: string) {
-  const git = (...a: string[]) => exec('git', ['-C', slotDir, '-c', 'user.name=ue-fleet', '-c', 'user.email=ue-fleet@localhost', '-c', 'core.autocrlf=false', '-c', 'core.safecrlf=false', ...a], { windowsHide: true, maxBuffer: 1 << 26 });
-  if (!fs.existsSync(path.join(slotDir, '.git'))) {
+  // Git's automatic repack is a problem here even for an agent's own commits: it holds the commit
+  // up until it finishes, and several copies repacking at once can use all of the machine's memory.
+  const git = (...a: string[]) => exec('git', ['-C', slotDir, '-c', 'user.name=ue-fleet', '-c', 'user.email=ue-fleet@localhost', '-c', 'core.autocrlf=false', '-c', 'core.safecrlf=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...a], { windowsHide: true, maxBuffer: 1 << 26 });
+  const repo = path.join(slotDir, '.git');
+  if (!fs.existsSync(path.join(repo, TEXT_ONLY_MARKER))) await fsp.rm(repo, { recursive: true, force: true });
+  if (!fs.existsSync(repo)) {
     await git('init', '-q');
     // Agents run plain `git diff` here, so the repo itself must not rewrite line endings either.
     await git('config', 'core.autocrlf', 'false');
+    await git('config', 'gc.auto', '0');
+    await git('config', 'maintenance.auto', 'false');
+    await fsp.writeFile(path.join(repo, TEXT_ONLY_MARKER), '');
   }
   await fsp.writeFile(path.join(slotDir, '.git', 'info', 'exclude'), GIT_EXCLUDE);
   await git('add', '-A');
@@ -265,6 +285,84 @@ export async function applyChanges(slotDir: string, sourceDir: string, only?: st
   }
   await fsp.writeFile(baselinePath(slotDir), JSON.stringify(baseline));
   return result;
+}
+
+// ---- Agents sharing one project folder ----
+
+// There's no copy to compare against, so what changed is whatever is newer than the task.
+export async function changedSince(dir: string, since: number): Promise<ChangedFile[]> {
+  const files: string[] = [];
+  for await (const rel of walk(dir)) {
+    if (!rel.startsWith('Binaries') && !/[\\/]Binaries[\\/]/.test(rel)) files.push(rel);
+  }
+  const out: ChangedFile[] = [];
+  await pool(files, 24, async (rel) => {
+    const st = await fsp.stat(path.join(dir, rel)).catch(() => null);
+    if (st && st.mtimeMs >= since) out.push({ path: rel, kind: st.birthtimeMs >= since ? 'added' : 'modified', binary: isBinaryPath(rel), size: st.size });
+  });
+  return out.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+// An editor with no asset registry cache spends minutes reading every asset, and the project's cache
+// is as good as its own would be, since it's reading the same files. Unreal never rewrites a cache
+// file, it only adds new ones and removes old ones, so a link is safe and costs no disk.
+export async function seedAssetCache(src: string, dst: string) {
+  const from = path.join(src, 'Intermediate');
+  const to = path.join(dst, 'Intermediate');
+  const folder = 'CachedAssetRegistry';
+  if (fs.existsSync(path.join(to, folder))) return;
+  const names = await fsp.readdir(path.join(from, folder)).catch(() => [] as string[]);
+  for (const ref of names.filter((n) => n.endsWith('.ref'))) {
+    const bin = (await fsp.readFile(path.join(from, folder, ref), 'utf8').catch(() => '')).trim();
+    if (!names.includes(bin)) continue;
+    await fsp.mkdir(path.join(to, folder), { recursive: true });
+    await fsp.link(path.join(from, folder, bin), path.join(to, folder, bin))
+      .catch(() => fsp.copyFile(path.join(from, folder, bin), path.join(to, folder, bin)))
+      .catch(() => {});
+    await fsp.writeFile(path.join(to, folder, ref), bin);
+  }
+  await fsp.copyFile(path.join(from, `${folder}Discovery.bin`), path.join(to, `${folder}Discovery.bin`)).catch(() => {});
+}
+
+const NO_MODULES_UNDER = new Set(['content', 'source', 'intermediate', 'saved', 'resources', 'config', 'thirdparty', 'shaders']);
+
+async function moduleFolders(projectDir: string): Promise<string[]> {
+  const found = [path.join(projectDir, 'Binaries', 'Win64')];
+  const visit = async (dir: string) => {
+    for (const e of await fsp.readdir(dir, { withFileTypes: true }).catch(() => [] as fs.Dirent[])) {
+      if (!e.isDirectory()) continue;
+      const name = e.name.toLowerCase();
+      if (name === 'binaries') found.push(path.join(dir, e.name, 'Win64'));
+      else if (!NO_MODULES_UNDER.has(name)) await visit(path.join(dir, e.name));
+    }
+  };
+  await visit(path.join(projectDir, 'Plugins'));
+  return found;
+}
+
+const isLoaded = (file: string) => fsp.open(file, 'r+').then((h) => h.close().then(() => false), () => true);
+
+// Windows lets a loaded DLL be renamed but not overwritten, so each one is swapped for an unlocked
+// copy. The linker can then replace it, and editors already running carry on with what they loaded,
+// the user's own included. The copy keeps the file's date, so a build doesn't think it's out of date.
+export async function freeLoadedModules(projectDir: string) {
+  for (const folder of await moduleFolders(projectDir)) {
+    for (const name of await fsp.readdir(folder).catch(() => [] as string[])) {
+      const file = path.join(folder, name);
+      // One left by an earlier build goes once nothing has it loaded any more.
+      if (/\.fleet-(old-\w+|new)$/.test(name)) { await fsp.rm(file, { force: true }).catch(() => {}); continue; }
+      if (!/\.(dll|exe|pdb)$/i.test(name) || !(await isLoaded(file))) continue;
+      const fresh = `${file}.fleet-new`;
+      try {
+        await fsp.copyFile(file, fresh);
+        await fsp.rename(file, `${file}.fleet-old-${crypto.randomBytes(3).toString('hex')}`);
+        await fsp.rename(fresh, file);
+      } catch {
+        // The build's own error says more than this could.
+        await fsp.rm(fresh, { force: true }).catch(() => {});
+      }
+    }
+  }
 }
 
 // ---- Pushing a project to another machine ----

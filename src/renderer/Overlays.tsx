@@ -370,6 +370,7 @@ export function TestsModal() {
   const groups = new Map<string, typeof tests>();
   for (const t of tests) groups.set(t.agentId, [...(groups.get(t.agentId) ?? []), t]);
   const open_ = tests.filter((t) => !t.done).length;
+  const canApply = cards.some((c) => !c.archived && c.project && !(c.slot?.shared && c.nodeId === 'master'));
   const applyAll = async () => {
     setBusy(true);
     try { setBatch(await window.fleet.call<BatchApply[]>('applyFinished')); } finally { setBusy(false); }
@@ -379,7 +380,7 @@ export function TestsModal() {
       <div className="modal wide" role="dialog" aria-label="Needs testing" data-tests>
         <div className="modal-head">
           <h2>Needs testing</h2><span className="tests-count">{open_} left</span>
-          <span className="modal-hint"><button className="btn small" disabled={busy} onClick={() => void applyAll()} data-apply-finished>{busy ? 'Applying…' : 'Apply all finished'}</button> <kbd>Esc</kbd> Close</span>
+          <span className="modal-hint">{canApply && <button className="btn small" disabled={busy} onClick={() => void applyAll()} data-apply-finished>{busy ? 'Applying…' : 'Apply all finished'}</button>} <kbd>Esc</kbd> Close</span>
         </div>
         {batch && (
           <div className="apply-result" data-apply-report>

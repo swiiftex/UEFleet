@@ -15,23 +15,39 @@ export const FLEET_TOOLS = [
   'ue_launch_game', 'ue_stop_games', 'ue_log', 'ue_crash', 'ue_stop', 'finish_task',
 ].map((n) => `mcp__fleet__${n}`);
 
+const SHARED_FOLDER = (slot: Slot) => `You're working directly in the user's project at ${slot.dir}. Other agents on this machine work in the same files, and the user may be too. Whatever you save is in their workspace straight away, with nothing to apply afterwards. Your own editor keeps its logs, settings and saves in ${slot.own}, so you never queue for Play In Editor.`;
+const PRIVATE_COPY = (slot: Slot) => `You have a private copy of the project at ${slot.dir} and your own editor instance. Other agents have their own, so you never queue for a build or for Play In Editor. Nothing here touches the user's real project until the user applies your changes, so test freely.`;
+
+const SHARED_BUILD = "ue_build compiles the project, and builds of it run one at a time, so it may wait for another agent's. It stops your editor first, and the next ue_call boots it again. Other editors keep running the code they started with: ue_status says when a newer build than your editor's exists, and ue_stop followed by any ue_call picks it up.";
+const COPY_BUILD = 'ue_build compiles your copy. It stops your editor first, and the next ue_call boots it again.';
+
+const SHARED_RULES = `
+Because these files are shared:
+- Never run anything that reverts, resets, stashes, cleans, switches or updates the workspace, such as git checkout, reset, stash or clean, cm undo, switch or update, or p4 revert or sync. It would destroy uncommitted work belonging to the user and to other agents. Don't check in or commit unless the user asks.
+- Change only what your task needs. Changes you didn't make aren't yours to fix or undo. ue_status lists who else is working here and on what.
+- If a build fails in code you didn't touch, another agent is probably part way through an edit. Wait a couple of minutes and build again before doing anything about it.
+- When two agents save the same asset, the last save wins and the other's work is lost with no warning. Check ue_status before changing an asset others are likely to need, such as a map, and if your editor has had an asset open for a while, reload it before changing it.
+- A read-only file is locked by source control. Check it out with the project's own tool, such as p4 edit, instead of clearing the flag.
+- If a build says Live Coding is active, the user has the project open in their own editor. Tell them, and wait for them to close it or turn Live Coding off.
+`;
+
 export function appendPrompt(slot: Slot | null, projectNotes?: string) {
   const instance = slot ? `
 # Your Unreal instance
-You have a private copy of the project at ${slot.dir} and your own editor instance. Other agents have their own, so you never queue for a build or for Play In Editor. Nothing here touches the user's real project until the user applies your changes, so test freely.
+${slot.shared ? SHARED_FOLDER(slot) : PRIVATE_COPY(slot)}
 
 Use the mcp__fleet tools for all Unreal work:
 - ue_list_toolsets, ue_describe_toolset and ue_call drive your editor (Play In Editor, logs, screenshots, assets, automation). The editor boots on first use and restarts itself after a crash or a build.
-- ue_build compiles your copy. It stops your editor first, and the next ue_call boots it again. If it fails because it would modify engine files, the engine itself needs a rebuild that only the user can do. Don't work around that: say so in your final message.
+- ${slot.shared ? SHARED_BUILD : COPY_BUILD} If it fails because it would modify engine files, the engine itself needs a rebuild that only the user can do. Don't work around that: say so in your final message.
 - ue_run_tests runs automation tests in a separate process. Pass render true for tests that need a GPU, such as visual or flow tests. ue_launch_game starts real standalone game processes, including a listen server with clients for networking checks.
 - ue_log reads your editor log and ue_crash reports the newest crash with its callstack.
 
-Don't start UnrealEditor, Build.bat or UnrealBuildTool yourself. There is a git repository over this copy's text files, so git diff shows your code changes. Saved/SaveGames starts as a copy of the user's saves, and nothing you do to it reaches the real ones.
-
+Don't start UnrealEditor, Build.bat or UnrealBuildTool yourself. ${slot.shared ? 'Your own Saved/SaveGames' : "There is a git repository over this copy's text files, so git diff shows your code changes. Saved/SaveGames"} starts as a copy of the user's saves, and nothing you do to it reaches the real ones.
+${slot.shared ? SHARED_RULES : ''}
 The project's CLAUDE.md and memory notes were mostly written for someone working in the real project with one shared editor. They still apply for code, gameplay and test knowledge, but these rules win wherever they disagree:
 - Anything that reaches an editor on a fixed port or through remote Python execution, such as a helper script or a port number in the notes, reaches the user's own editor and could cost them work. Use only the ue_ tools, which always reach yours.
-- This copy and this editor are yours alone. Rebuild and restart them whenever you need to, without asking, and don't coordinate with other sessions about them.
-- Notes you save go into the real project's memory, so only write what's true for the real project, not details of this copy.
+- ${slot.shared ? "Your editor is yours alone, and a build doesn't disturb anyone else's. Rebuild and restart whenever you need to, without asking, and don't coordinate with other sessions about it." : "This copy and this editor are yours alone. Rebuild and restart them whenever you need to, without asking, and don't coordinate with other sessions about them."}
+- Notes you save go into the real project's memory, so only write what's true for the real project${slot.shared ? ', not details of your own instance' : ', not details of this copy'}.
 ` : '';
   const notes = projectNotes ? `\n# Notes for this project\n${projectNotes}\n` : '';
   return `${instance}${notes}
@@ -86,9 +102,9 @@ export function fleetServer(slot: Slot | null, onFinish: (r: FinalReport) => voi
     name: 'fleet',
     version: '1.0.0',
     tools: [
-      always('ue_status', 'State of your Unreal instance: copy location, engine, editor state.', {}, guarded(async () => {
+      always('ue_status', 'State of your Unreal instance: project location, engine, editor state, and who else is working in the same project folder.', {}, guarded(async () => {
         const s = needSlot();
-        return text(JSON.stringify({ project: s.projectFile, engine: s.engine?.version ?? null, engineRoot: s.engine?.root ?? null, state: s.state, detail: s.detail, mode: s.mode, editorLog: s.logFile, nativeMcp: !!s.engine?.hasMcp }, null, 2));
+        return text(JSON.stringify({ project: s.projectFile, engine: s.engine?.version ?? null, engineRoot: s.engine?.root ?? null, state: s.state, detail: s.detail, mode: s.mode, editorLog: s.logFile, nativeMcp: !!s.engine?.hasMcp, ...s.sharing() }, null, 2));
       })),
       always('ue_list_toolsets', 'List the toolsets of your editor. Boots the editor if it is not running.', {}, guarded(async () => callMcp('list_toolsets', {}))),
       always('ue_describe_toolset', 'Get the tools and input schemas of one toolset in your editor.', { toolset_name: z.string() }, guarded(async (a) => callMcp('describe_toolset', a))),
@@ -104,7 +120,7 @@ export function fleetServer(slot: Slot | null, onFinish: (r: FinalReport) => voi
         if (a.tool_name === 'StopPIE' || (a.tool_name === 'StartPIE' && r?.isError)) s.setState('ready');
         return liftImages(r);
       })),
-      always('ue_build', 'Compile your copy of the project. Stops your editor first. Returns the errors and the end of the output.', {
+      always('ue_build', 'Compile the project. Stops your editor first. Returns the errors and the end of the output.', {
         target: z.string().optional().describe('Defaults to <Project>Editor.'),
         config: z.string().optional().describe('Defaults to Development.'),
       }, guarded(async (a) => {

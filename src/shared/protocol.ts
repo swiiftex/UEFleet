@@ -80,6 +80,8 @@ export interface SlotInfo {
   nodeId: string;
   project: string;
   dir: string;
+  own?: string; // this agent's own folder, which differs from dir when the project folder is shared
+  shared?: boolean;
   port: number;
   state: SlotState;
   agentId?: string;

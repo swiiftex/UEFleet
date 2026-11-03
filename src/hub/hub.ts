@@ -8,7 +8,7 @@ import path from 'node:path';
 import { NodeService } from '../node/nodeService';
 import { buildManifest, CHUNK, isBinaryPath, readChunk, writeChunk, mergeText } from '../node/projectSync';
 import { readProject } from '../node/machine';
-import { BUCKETS, type ActivityBucket, type AgentCard, type AgentEvent, type AgentSpawn, type ApplyResult, type Broadcast, type ChangedFile, type FleetSnapshot, type HubEvent, type ImageAttachment, type MachineView, type NewTask, type NewTaskDefaults, type NodeEvent, type SlotInfo, type TranscriptItem } from '../shared/protocol';
+import { BUCKETS, type ActivityBucket, type AgentCard, type AgentEvent, type AgentSpawn, type ApplyResult, type Broadcast, type ChangedFile, type FleetSnapshot, type HubEvent, type ImageAttachment, type MachineView, type NewTask, type NewTaskDefaults, type NodeEvent, type ProjectInfo, type SlotInfo, type TranscriptItem } from '../shared/protocol';
 import { LinkServer, type RemoteNode } from './link';
 
 const emptyBuckets = () => Object.fromEntries(BUCKETS.map((b) => [b, 0])) as Record<ActivityBucket, number>;
@@ -29,9 +29,20 @@ interface AgentRec {
   spawn: AgentSpawn;
   answeringBroadcast?: boolean;
   sourceProjectDir?: string; // the real project on the master, where applied changes land
+  notStarted?: boolean; // its project never reached its machine, so the next message tries again
+  stopSending?: boolean;
+  sendQuestion?: { id: string; answer: (send: boolean) => void };
+  applied?: Map<string, number>; // the date each file had when it was last applied here
 }
 
-export interface HubOptions { dataDir: string; version: string; demo: boolean; hostAppPath: string | null }
+export interface HubOptions { dataDir: string; version: string; demo: boolean; hostAppPath: string | null; askBeforeSendingBytes?: number }
+
+// Sending more than this across a network is worth a question first.
+const ASK_BEFORE_SENDING_BYTES = 2 ** 30;
+const SEND_IT = 'Send it';
+const sizeText = (bytes: number) => (bytes >= 2 ** 30 ? `${(bytes / 2 ** 30).toFixed(1)} GB` : `${Math.round(bytes / 2 ** 20)} MB`);
+
+class SendStopped extends Error {}
 
 export class Hub extends EventEmitter {
   local: NodeService;
@@ -196,7 +207,7 @@ export class Hub extends EventEmitter {
         break;
       case 'instance':
         c.slot = ev.slot;
-        if (ev.slot) { c.cwd = ev.slot.dir; r.slotDir = ev.slot.dir; }
+        if (ev.slot) { c.cwd = ev.slot.dir; r.slotDir = ev.slot.own ?? ev.slot.dir; }
         if (ev.slot && (ev.slot.state === 'queued') && LIVE.has(c.status)) { c.status = 'waiting-instance'; c.detail = ev.slot.detail; this.setBucket(r, 'waiting'); }
         else if (ev.slot && c.status === 'waiting-instance' && ev.slot.state !== 'queued') { c.status = 'testing'; this.setBucket(r, 'testing'); }
         if (ev.slot?.state === 'crashed' && LIVE.has(c.status)) this.note(r, `Unreal crashed in this instance. ${ev.slot.detail ?? ''}`, 'warn');
@@ -409,16 +420,16 @@ export class Hub extends EventEmitter {
       id, prompt: task.prompt, images: task.images, title, model: task.model, effort: task.effort, permissionMode: task.permissionMode, instanceMode: task.instanceMode, demo: task.demo,
       project: project ? { name: project.name, file: project.file, engineRoot: nodeId === 'master' ? this.local.info.engines.find((e) => e.id === project.engineAssociation)?.root : undefined } : null,
     };
-    const rec: AgentRec = { card, transcript: [], byId: new Map(), bucket: null, bucketSince: Date.now(), tokensThisTick: 0, lastSeq: 0, pendingItems: new Map(), pendingDeltas: new Map(), spawn, sourceProjectDir: project?.dir };
+    const rec: AgentRec = { card, transcript: [], byId: new Map(), bucket: null, bucketSince: Date.now(), tokensThisTick: 0, lastSeq: 0, pendingItems: new Map(), pendingDeltas: new Map(), spawn, sourceProjectDir: project?.dir, notStarted: nodeId !== 'master' && !!project };
     this.agents.set(id, rec);
     this.dirtyCards.add(id);
     this.wasBusy = true;
     this.scheduleSave();
-    void this.launch(rec, task, project?.dir ?? null, project?.engineVersion);
+    void this.launch(rec, project?.dir ?? null, project?.engineVersion);
     return id;
   }
 
-  private async launch(rec: AgentRec, task: NewTask, projectDir: string | null, engineVersion?: string) {
+  private async launch(rec: AgentRec, projectDir: string | null, engineVersion?: string) {
     const nodeId = rec.card.nodeId;
     try {
       if (nodeId !== 'master' && projectDir && rec.spawn.project) {
@@ -427,23 +438,31 @@ export class Hub extends EventEmitter {
         // A copy the user already keeps on that machine (their own Plastic or git workspace) beats
         // sending tens of GB across the network. Only copies this app sent get updated by sending.
         const node = this.link.nodes.get(nodeId);
-        const own = node?.info.projects.find((p) => p.name === name && !p.received);
+        // An older host can't be asked again, so what it reported on connecting has to do.
+        const projects = await this.nodeCall<ProjectInfo[]>(nodeId, 'machine.refreshProjects', {}).catch(() => node?.info.projects ?? []);
+        if (node) { node.info.projects = projects; this.machinesDirty = true; }
+        const copies = projects.filter((p) => p.name.toLowerCase() === name.toLowerCase() && !p.received);
+        const own = copies[0];
         if (own) {
-          this.note(rec, `Using the copy of ${name} already on ${node!.info.name}: ${own.dir}`);
+          const others = copies.slice(1).map((p) => p.dir).join(', ');
+          this.note(rec, `Using the copy of ${name} already on ${node!.info.name}: ${own.dir}${others ? `. Also found ${others}. To choose, run fleet-host.exe --project "<folder>" on that machine.` : ''}`);
           rec.spawn.project = { name, file: own.file };
         } else {
           rec.card.status = 'provisioning';
           rec.card.detail = 'Sending project to the machine';
           this.dirtyCards.add(rec.card.id);
-          const file = await this.pushProject(nodeId, name, projectDir, uproject, (done, total) => {
+          const file = await this.pushProject(rec, nodeId, name, projectDir, uproject, (done, total) => {
             rec.card.detail = `Sending project: ${Math.round(100 * done / Math.max(1, total))}%`;
             this.dirtyCards.add(rec.card.id);
           });
           rec.spawn.project = { name, file };
         }
       }
+      if (rec.stopSending) return;
       await this.nodeCall(nodeId, 'agent.spawn', { ...rec.spawn, engineVersion });
+      rec.notStarted = false;
     } catch (e: any) {
+      if (e instanceof SendStopped) return;
       rec.card.status = 'attention';
       rec.card.attention = { kind: 'error', text: String(e?.message ?? e).slice(0, 160), at: Date.now() };
       this.note(rec, `Couldn't start: ${e?.message ?? e}`, 'error');
@@ -451,12 +470,36 @@ export class Hub extends EventEmitter {
     }
   }
 
+  // The answer comes back through answer(), like any other question, though no agent is running yet.
+  private askToSend(rec: AgentRec, name: string, uproject: string, total: number): Promise<boolean> {
+    const machine = this.link.nodes.get(rec.card.nodeId)?.info.name ?? 'that machine';
+    const id = `send-${crypto.randomBytes(4).toString('hex')}`;
+    const question = `Send ${sizeText(total)} of ${name} to ${machine}? No copy was found there.`;
+    this.addItem(rec, { kind: 'question', id, at: Date.now(), questions: [{ question, header: 'Send project', options: [
+      { label: SEND_IT, description: `Copies ${sizeText(total)} across the network. Later tasks only send what changed.` },
+      { label: "Don't send", description: `If there's a copy on ${machine}, run fleet-host.exe --project "<path to ${uproject}>" there, then message this card to try again.` },
+    ] }] });
+    rec.card.status = 'attention';
+    rec.card.attention = { kind: 'question', text: question, at: Date.now(), ref: id };
+    this.dirtyCards.add(rec.card.id);
+    this.emit('attention', rec.card);
+    return new Promise((resolve) => { rec.sendQuestion = { id, answer: resolve }; });
+  }
+
+  // Stopping a card that's still getting its project also stops the transfer.
+  private stopSend(r: AgentRec) {
+    r.stopSending = true;
+    r.sendQuestion?.answer(false);
+    r.sendQuestion = undefined;
+  }
+
   // Sends only what's missing or changed, in parallel, with each chunk acknowledged.
-  private async pushProject(nodeId: string, name: string, dir: string, uproject: string, onProgress: (done: number, total: number) => void): Promise<string> {
+  private async pushProject(rec: AgentRec, nodeId: string, name: string, dir: string, uproject: string, onProgress: (done: number, total: number) => void): Promise<string> {
     const manifest = await buildManifest(dir);
     const need = await this.nodeCall<string[]>(nodeId, 'project.plan', { name, manifest });
     const sizes = new Map(manifest.map((m) => [m.path, m]));
     const total = need.reduce((s, p) => s + (sizes.get(p)?.size ?? 0), 0);
+    if (total >= (this.opts.askBeforeSendingBytes ?? ASK_BEFORE_SENDING_BYTES) && !(await this.askToSend(rec, name, uproject, total))) throw new SendStopped();
     let done = 0;
     const queue = [...need];
     await Promise.all(Array.from({ length: 6 }, async () => {
@@ -465,6 +508,7 @@ export class Hub extends EventEmitter {
         const m = sizes.get(rel)!;
         let offset = 0;
         while (true) {
+          if (rec.stopSending) throw new SendStopped();
           const chunk = await readChunk(path.join(dir, rel), offset);
           await this.nodeCall(nodeId, 'project.put', { name, path: rel, offset, data: chunk.data, last: chunk.last, mtime: m.mtime });
           offset += CHUNK;
@@ -487,6 +531,16 @@ export class Hub extends EventEmitter {
     r.card.attention = null;
     r.card.runningSince = r.card.runningSince ?? Date.now();
     this.dirtyCards.add(agentId);
+    if (r.notStarted) {
+      // It never reached its machine, so try again from the start, carrying what was just said.
+      this.stopSend(r);
+      r.stopSending = false;
+      r.spawn.prompt = `${r.spawn.prompt}\n\n${text}`;
+      r.card.status = 'queued';
+      const project = readProject(r.spawn.project!.file, this.local.info.engines);
+      void this.launch(r, r.sourceProjectDir ?? null, project?.engineVersion);
+      return;
+    }
     await this.ensureRunning(r);
     await this.nodeCall(r.card.nodeId, 'agent.send', { agentId, text, images, broadcastId });
   }
@@ -523,13 +577,36 @@ export class Hub extends EventEmitter {
     const r = this.need(agentId);
     const item = r.byId.get(itemId);
     if (item?.kind === 'question') this.addItem(r, { ...item, answers });
+    if (r.sendQuestion?.id === itemId) {
+      const send = Object.values(answers)[0] === SEND_IT;
+      const { answer } = r.sendQuestion;
+      r.sendQuestion = undefined;
+      r.card.attention = null;
+      if (send) r.card.status = 'provisioning';
+      else {
+        this.stopClock(r);
+        r.card.status = 'stopped';
+        r.card.tps = 0;
+        this.note(r, 'Nothing was sent. Message this card to try again.');
+      }
+      this.dirtyCards.add(agentId);
+      this.scheduleSave();
+      answer(send);
+      if (!send) this.checkAllDone();
+      return;
+    }
     await this.nodeCall(r.card.nodeId, 'agent.answer', { agentId, itemId, answers });
   }
 
-  interrupt(agentId: string) { return this.nodeCall(this.need(agentId).card.nodeId, 'agent.interrupt', { agentId }); }
+  interrupt(agentId: string) {
+    const r = this.need(agentId);
+    if (r.notStarted) return this.stopAgent(agentId);
+    return this.nodeCall(r.card.nodeId, 'agent.interrupt', { agentId });
+  }
 
   async stopAgent(agentId: string) {
     const r = this.need(agentId);
+    this.stopSend(r);
     await this.nodeCall(r.card.nodeId, 'agent.stop', { agentId }).catch(() => {});
     this.setBucket(r, null);
     this.stopClock(r);
@@ -543,7 +620,8 @@ export class Hub extends EventEmitter {
 
   async archive(agentId: string) {
     const r = this.need(agentId);
-    await this.nodeCall(r.card.nodeId, 'agent.stop', { agentId, releaseSlot: true }).catch(() => {});
+    this.stopSend(r);
+    await this.nodeCall(r.card.nodeId, 'agent.stop', { agentId, releaseSlot: true, slotDir: r.slotDir }).catch(() => {});
     r.card.archived = true;
     r.card.attention = null;
     this.dirtyCards.add(agentId);
@@ -589,7 +667,7 @@ export class Hub extends EventEmitter {
     const out: { agentId: string; title: string; applied: number; conflicts: ApplyResult['conflicts']; error?: string }[] = [];
     for (const r of this.agents.values()) {
       const c = r.card;
-      if (c.archived || c.status !== 'finished' || !c.project) continue;
+      if (c.archived || c.status !== 'finished' || !c.project || (c.slot?.shared && c.nodeId === 'master')) continue;
       try {
         const files = (await this.changes(c.id)).filter((f) => !f.usuallySkipped);
         if (!files.length) continue;
@@ -614,6 +692,13 @@ export class Hub extends EventEmitter {
       if (only && !only.includes(c.path)) continue;
       const target = path.join(dest, c.path);
       if (c.kind === 'deleted') { await fsp.rm(target, { force: true }); result.applied.push(c.path); continue; }
+      // A shared folder keeps no base version to merge from, so a file that also changed here since
+      // the task started is left for the user to decide about.
+      const here = await fsp.stat(target).catch(() => null);
+      if (r.card.slot?.shared && here && here.mtimeMs >= r.card.createdAt && here.mtimeMs !== r.applied?.get(c.path) && !force.includes(c.path)) {
+        result.conflicts.push({ path: c.path, reason: 'Also changed on this machine since the task started.' });
+        continue;
+      }
       let offset = 0;
       while (true) {
         const chunk = await this.nodeCall<{ data: string; last: boolean; mtime: number }>(r.card.nodeId, 'agent.readFile', { agentId, path: c.path, offset });
@@ -637,6 +722,7 @@ export class Hub extends EventEmitter {
           await fsp.rename(`${target}.fleet-in`, target);
           result.applied.push(c.path);
         }
+        (r.applied ??= new Map()).set(c.path, (await fsp.stat(target)).mtimeMs);
       } catch (e: any) {
         result.conflicts.push({ path: c.path, reason: String(e?.message ?? e) });
       }
@@ -670,7 +756,7 @@ export class Hub extends EventEmitter {
   }
 
   saveNow() {
-    const agents = [...this.agents.values()].map((r) => ({ card: r.card, spawn: { ...r.spawn, images: undefined }, slotDir: r.slotDir, lastSeq: r.lastSeq, sourceProjectDir: r.sourceProjectDir }));
+    const agents = [...this.agents.values()].map((r) => ({ card: r.card, spawn: { ...r.spawn, images: undefined }, slotDir: r.slotDir, lastSeq: r.lastSeq, sourceProjectDir: r.sourceProjectDir, notStarted: r.notStarted }));
     fs.mkdirSync(this.opts.dataDir, { recursive: true });
     const tmp = `${this.stateFile()}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify({ agents, nextIndex: this.nextIndex, defaults: this.defaults, doneTests: [...this.doneTests], broadcasts: this.broadcasts }));
@@ -692,9 +778,11 @@ export class Hub extends EventEmitter {
       // Local runs ended with the app, so show them as idle. Remote ones report in when they reconnect.
       if (card.nodeId === 'master' && LIVE.has(card.status)) card.status = 'idle';
       if (card.attention?.ref) card.attention = null;
+      // Whatever was sending or asking died with the app, and a message picks it up again.
+      if (a.notStarted) card.status = 'stopped';
       card.runningSince = null;
       card.tps = 0;
-      this.agents.set(card.id, { card, transcript, byId, bucket: null, bucketSince: Date.now(), tokensThisTick: 0, lastSeq: a.lastSeq ?? 0, pendingItems: new Map(), pendingDeltas: new Map(), slotDir: a.slotDir, spawn: a.spawn, sourceProjectDir: a.sourceProjectDir });
+      this.agents.set(card.id, { card, transcript, byId, bucket: null, bucketSince: Date.now(), tokensThisTick: 0, lastSeq: a.lastSeq ?? 0, pendingItems: new Map(), pendingDeltas: new Map(), slotDir: a.slotDir, spawn: a.spawn, sourceProjectDir: a.sourceProjectDir, notStarted: a.notStarted });
     }
   }
 

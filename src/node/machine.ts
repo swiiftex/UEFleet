@@ -115,25 +115,128 @@ export function readProject(file: string, engines: EngineInfo[]): ProjectInfo | 
   }
 }
 
-// UE records recent projects per engine version; newest entry wins across versions.
-export function discoverProjects(engines: EngineInfo[]): ProjectInfo[] {
+const RECENTS_INI = 'Saved/Config/WindowsEditor/EditorSettings.ini';
+
+// UE records recent projects per user for installed engines, and inside the engine itself for
+// source builds. Newest entry wins across all of them.
+function recentProjectFiles(engines: EngineInfo[]): string[] {
   const base = path.join(process.env.LOCALAPPDATA ?? '', 'UnrealEngine');
+  const list = (d: string) => { try { return fs.readdirSync(d); } catch { return []; } };
+  const inis = [
+    ...list(base).map((v) => path.join(base, v, RECENTS_INI)),
+    ...engines.map((e) => path.join(e.root, 'Engine', RECENTS_INI)),
+  ];
   const seen = new Map<string, { file: string; at: string }>();
-  let versions: string[] = [];
-  try { versions = fs.readdirSync(base); } catch { /* no UE on this machine */ }
-  for (const v of versions) {
+  for (const file of inis) {
     let ini = '';
-    try { ini = fs.readFileSync(path.join(base, v, 'Saved/Config/WindowsEditor/EditorSettings.ini'), 'utf8'); } catch { continue; }
+    try { ini = fs.readFileSync(file, 'utf8'); } catch { continue; }
     for (const m of ini.matchAll(/RecentlyOpenedProjectFiles=\(ProjectName="([^"]+)",LastOpenTime=([^)]+)\)/g)) {
-      const key = m[1].toLowerCase();
+      const key = path.normalize(m[1]).toLowerCase();
       if (!seen.has(key) || seen.get(key)!.at < m[2]) seen.set(key, { file: m[1], at: m[2] });
     }
   }
-  return [...seen.values()]
-    .sort((a, b) => b.at.localeCompare(a.at))
-    .filter((p) => fs.existsSync(p.file) && !isFleetCopy(p.file))
-    .map((p) => readProject(p.file, engines))
-    .filter((p): p is ProjectInfo => !!p);
+  return [...seen.values()].sort((a, b) => b.at.localeCompare(a.at)).map((p) => p.file);
+}
+
+// Plastic's list has one workspace per line: id, name, path, then sometimes "dynamic".
+export function parsePlasticWorkspaces(text: string): string[] {
+  return text.split(/\r?\n/).filter((l) => l && !l.startsWith('//')).map((l) => l.split('\t')[2]).filter(Boolean);
+}
+
+// Git clients each store their repo list differently, some as JSON and some in a database. Every
+// path they hold looks the same in the bytes though, and anything that isn't a real folder is
+// dropped later.
+export function pathsIn(text: string): string[] {
+  const out = new Set<string>();
+  for (const m of text.matchAll(/(?<![A-Za-z])[A-Za-z]:(?:\\\\|\\|\/)[^"'<>|?*\x00-\x1f\x7f-￿]*/g)) out.add(m[0].replace(/\\\\/g, '\\').trim());
+  return [...out];
+}
+
+function perforceRootsNow(): string[] {
+  const p4 = (...args: string[]) => {
+    try {
+      return execFileSync('p4', args, { encoding: 'utf8', windowsHide: true, timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch {
+      return '';
+    }
+  };
+  const user = p4('-F', '%userName%', 'info', '-s').trim();
+  return user ? p4('-F', '%Root%', 'clients', '-u', user).split(/\r?\n/).filter(Boolean) : [];
+}
+
+// Asking means reaching the server, which may be slow or down, so don't ask for every task.
+let perforceCache: { at: number; roots: string[] } | null = null;
+function perforceRoots(): string[] {
+  if (!perforceCache || Date.now() - perforceCache.at > 5 * 60_000) perforceCache = { at: Date.now(), roots: perforceRootsNow() };
+  return perforceCache.roots;
+}
+
+// Workspaces that version control tools have listed on this machine.
+function versionControlFolders(): string[] {
+  const local = process.env.LOCALAPPDATA ?? '';
+  const roaming = process.env.APPDATA ?? '';
+  const read = (f: string, encoding: BufferEncoding = 'latin1') => { try { return fs.readFileSync(f, encoding); } catch { return ''; } };
+  const list = (d: string) => { try { return fs.readdirSync(d); } catch { return []; } };
+  const desktop = path.join(roaming, 'GitHub Desktop/IndexedDB/file__0.indexeddb.leveldb');
+  const kraken = path.join(roaming, '.gitkraken/profiles');
+  const gitLists = [
+    ...list(desktop).filter((f) => /\.(log|ldb)$/.test(f)).map((f) => path.join(desktop, f)),
+    path.join(local, 'Atlassian/SourceTree/opentabs.xml'),
+    path.join(local, 'Atlassian/SourceTree/bookmarks.xml'),
+    path.join(local, 'Fork/settings.json'),
+    ...list(kraken).map((p) => path.join(kraken, p, 'localRepoCache')),
+  ];
+  return [
+    ...parsePlasticWorkspaces(read(path.join(local, 'plastic4/plastic.workspaces'), 'utf8')),
+    ...perforceRoots(),
+    ...gitLists.flatMap((f) => pathsIn(read(f))),
+  ];
+}
+
+// Where those tools and Unreal put things unless told otherwise.
+function usualProjectFolders(): string[] {
+  const home = os.homedir();
+  return ['wkspaces', 'Documents/GitHub', 'Documents/Unreal Projects', 'source/repos', 'Perforce', 'p4'].map((d) => path.join(home, d));
+}
+
+const NEVER_HOLDS_PROJECTS = new Set(['engine', 'content', 'binaries', 'intermediate', 'saved', 'deriveddatacache', 'plugins', 'source', 'config', 'build', 'node_modules', '.git', '.plastic', '.svn', '.vs', '.fleet']);
+
+// A project sits at the top of its repo or a folder or two inside, and a folder of repos adds one
+// more level. Going deeper would only find sample projects and take longer.
+export function projectFilesUnder(dir: string, depth = 2): string[] {
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  const here = entries.filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.uproject')).map((e) => path.join(dir, e.name));
+  if (here.length || depth === 0) return here;
+  return entries
+    .filter((e) => e.isDirectory() && !NEVER_HOLDS_PROJECTS.has(e.name.toLowerCase()))
+    .flatMap((e) => projectFilesUnder(path.join(dir, e.name), depth - 1));
+}
+
+// The order decides which copy a task uses when a machine has more than one: the one most recently
+// opened in Unreal, then what version control lists, then the usual folders.
+export function discoverProjects(engines: EngineInfo[]): ProjectInfo[] {
+  // A list can name a whole drive, which is no place to go looking.
+  const folders = [...versionControlFolders(), ...usualProjectFolders()].map((f) => path.normalize(f)).filter((f) => path.dirname(f) !== f);
+  const seen = new Set<string>();
+  const out: ProjectInfo[] = [];
+  for (const raw of [...recentProjectFiles(engines), ...[...new Set(folders)].flatMap((f) => projectFilesUnder(f))]) {
+    const file = path.normalize(raw);
+    const key = file.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (!fs.existsSync(file) || isFleetCopy(file)) continue;
+    const p = readProject(file, engines);
+    if (p) out.push(p);
+  }
+  return out;
+}
+
+// What someone typed into --project: the .uproject itself, or the folder it's in.
+export function projectFileFrom(given: string): string | null {
+  const p = path.resolve(given.trim().replace(/"+$/, ''));
+  if (p.toLowerCase().endsWith('.uproject')) return fs.existsSync(p) ? p : null;
+  return projectFilesUnder(p, 0)[0] ?? null;
 }
 
 // Optional .uefleet.json beside the .uproject, for what only that project knows.

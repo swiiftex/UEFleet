@@ -16,10 +16,20 @@ process.env.ANTHROPIC_API_KEY = 'scripted';
 
 const { Hub } = await import('../src/hub/hub');
 const { encodePairCode, decodePairCode } = await import('../src/shared/pair');
+const { forgetCopiesFromRecents } = await import('../src/node/machine');
 type Item = any;
 
 const ROOT = process.env.FLEET_ROOT!;
-const PROJECT = path.join(ROOT, 'probe', 'FleetProbe', 'FleetProbe.uproject');
+// Editors now work in the project itself, so they get a throwaway one. The second has a name no
+// editor here has opened, so a host on this PC won't find it and has to be sent it.
+const probeCopy = (name: string) => {
+  const dir = path.join(dataDir, name);
+  fs.cpSync(path.join(ROOT, 'probe', 'FleetProbe'), dir, { recursive: true });
+  fs.renameSync(path.join(dir, 'FleetProbe.uproject'), path.join(dir, `${name}.uproject`));
+  return path.join(dir, `${name}.uproject`);
+};
+const PROJECT = probeCopy('FleetProbe');
+const SENT_PROJECT = probeCopy('FleetSent');
 const shots = path.join(ROOT, 'test', 'screenshots');
 fs.mkdirSync(shots, { recursive: true });
 const TOOLSET = 'EditorToolset.EditorAppToolset';
@@ -195,7 +205,11 @@ try {
   check('agent A finished through finish_task', ca.status === 'finished' && !!ca.final, ca.attention);
   check('agent B finished through finish_task', cb.status === 'finished' && !!cb.final, cb.attention);
   check('both editors were in PIE at the same moment', watch.both, [...watch.states]);
-  check('each agent got its own copy and its own port', ca.slot.dir !== cb.slot.dir && ca.slot.port !== cb.slot.port, [ca.slot, cb.slot]);
+  check('both worked in the project folder, each with its own port and own folder', ca.slot.dir === path.dirname(PROJECT) && cb.slot.dir === ca.slot.dir && ca.slot.shared && ca.slot.port !== cb.slot.port && ca.slot.own !== cb.slot.own, [ca.slot, cb.slot]);
+  // An editor starts the build tool to check platforms, and the build tool keeps these two for anyone.
+  const inProject = (f: string) => { try { return fs.readdirSync(path.join(path.dirname(PROJECT), f)); } catch { return []; } };
+  check('and left nothing of theirs in it', !fs.existsSync(path.join(path.dirname(PROJECT), '.fleet')) && inProject('Saved').every((f) => f === 'UnrealBuildTool') && inProject('Intermediate').every((f) => f === 'Build'), [inProject('Saved'), inProject('Intermediate')]);
+  check('their editors wrote to their own folders', fs.existsSync(path.join(ca.slot.own, 'Saved')) && fs.existsSync(path.join(cb.slot.own, 'Saved')));
   const isPie = tools(a).find((t) => JSON.stringify(t.input).includes('IsPIERunning'));
   check('the CLI reached the editor and got a real answer', !!isPie?.result?.includes('true'), isPie);
   for (let i = 0; i < 100 && hub.local.slots.editors.inUse > 0; i++) await sleep(100);
@@ -221,16 +235,17 @@ try {
   const sys = JSON.stringify(systemSeen.get('pie-a') ?? '');
   check('the instance instructions reach the agent', sys.includes('Your Unreal instance'), sys.slice(0, 200));
   check('project notes are told who wins over a shared-editor habit', sys.includes('reaches the user') && sys.includes('fixed port'));
-  check('the real project memory reaches an agent in a copy', JSON.stringify(seen.find((s) => s.marker === 'pie-a')!.messages).includes('fleet-memory-marker-7731') || sys.includes('fleet-memory-marker-7731'));
+  check('the real project memory reaches the agent', JSON.stringify(seen.find((s) => s.marker === 'pie-a')!.messages).includes('fleet-memory-marker-7731') || sys.includes('fleet-memory-marker-7731'));
+  check('it is told it shares the folder', sys.includes('Never run anything that reverts') && sys.includes(JSON.stringify(path.dirname(PROJECT)).slice(1, -1)), sys.slice(0, 600));
 
-  log('Changes stay in the copy until applied');
-  check('the agent did not touch the real project', !fs.existsSync(iniSrc));
+  log('Changes land in the project straight away');
+  check('the edit is already in the project', fs.existsSync(iniSrc) && fs.readFileSync(iniSrc, 'utf8').includes('edited by agent A'));
   check('the source asset is byte-identical', sha(assetSrc) === assetHash);
   const changes = await hub.changes(a);
   check('the edit shows up as a change', changes.some((c: any) => c.path.replaceAll('\\', '/') === 'Config/DefaultGame.ini'), changes);
   const applied = await hub.apply(a);
-  check('apply succeeds', applied.conflicts.length === 0 && applied.applied.length >= 1, applied);
-  check('the real project now has the edit', fs.existsSync(iniSrc) && fs.readFileSync(iniSrc, 'utf8').includes('edited by agent A'));
+  check('and there is nothing to apply', applied.applied.length === 0 && applied.conflicts.length === 0, applied);
+  check('B can see A in the folder', tools(b).some((t) => t.name === 'mcp__fleet__ue_status' && t.result?.includes('otherAgentsHere')), tools(b).find((t) => t.name === 'mcp__fleet__ue_status'));
   fs.rmSync(iniSrc, { force: true });
 
   log('Editor crash recovery');
@@ -317,20 +332,19 @@ try {
     let remote: any;
     for (let i = 0; i < 200 && !remote; i++) { remote = hub.machines().find((m: any) => m.info.role === 'remote' && m.online); await sleep(100); }
     check('the host linked', !!remote, hostLogBox.text);
-    const rem = await hub.createAgent(task('remote', { projectFile: PROJECT, nodeId: remote.info.id }));
+    const rem = await hub.createAgent(task('remote', { projectFile: SENT_PROJECT, nodeId: remote.info.id }));
     const doneRem = await waitFor(rem, settled, 'the remote agent', 5 * 60_000);
     check('the remote agent finished', doneRem.status === 'finished' && !!doneRem.final, doneRem.attention);
     const isPieRem = tools(rem).find((t) => JSON.stringify(t.input).includes('IsPIERunning'));
     check('it drove an editor on the host', !!isPieRem?.result?.includes('false'), isPieRem);
-    check('its copy lives on the host', doneRem.slot.dir.includes(path.join(dataDir, 'host')), doneRem.slot.dir);
-    check('with the project the master sent', fs.existsSync(path.join(dataDir, 'host', 'projects', 'FleetProbe', 'FleetProbe.uproject')));
+    check('a project it was sent gets a copy, on the host', !doneRem.slot.shared && doneRem.slot.dir.includes(path.join(dataDir, 'host')), doneRem.slot);
+    check('from the project the master sent', fs.existsSync(path.join(dataDir, 'host', 'projects', 'FleetSent', 'FleetSent.uproject')));
 
     const remChanges = await hub.changes(rem);
     check('the master can see its changes', remChanges.some((c: any) => c.path.replaceAll('\\', '/') === 'Source/Remote/FromHost.cpp'), remChanges);
     const appliedRem = await hub.apply(rem);
-    const landed = path.join(path.dirname(PROJECT), 'Source/Remote/FromHost.cpp');
+    const landed = path.join(path.dirname(SENT_PROJECT), 'Source/Remote/FromHost.cpp');
     check('apply brings them back to the master', appliedRem.conflicts.length === 0 && fs.existsSync(landed) && fs.readFileSync(landed, 'utf8').includes('from the host'), appliedRem);
-    fs.rmSync(path.join(path.dirname(PROJECT), 'Source'), { recursive: true, force: true });
   } finally {
     hostProc.kill();
   }
@@ -356,6 +370,9 @@ try {
   clearInterval(watcher);
   await hub.shutdown();
   api.close();
+  // Marked as a copy so this throwaway project drops off Unreal's recent list.
+  fs.mkdirSync(path.join(path.dirname(PROJECT), '.fleet'), { recursive: true });
+  for (const e of hub.machines()[0].info.engines) forgetCopiesFromRecents(e.version);
   const failed = results.filter((x) => x.startsWith('FAIL'));
   console.log(`\n${results.join('\n')}\n\n${results.length - failed.length}/${results.length} passed`);
   assert.ok(results.length);

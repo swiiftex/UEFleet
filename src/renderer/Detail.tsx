@@ -272,9 +272,31 @@ function ChangesTab({ card }: { card: AgentCard }) {
     setUnticked(next);
   };
   if (!card.project) return <div className="tab-empty">This task has no project attached.</div>;
+  // Work in a shared folder on this machine is already in the project, so there's nothing to do but look.
+  const inPlace = !!card.slot?.shared && card.nodeId === 'master';
+  if (inPlace) return (
+    <div className="changes">
+      <p className="changes-note">This agent works directly in your project, so there's nothing to apply. These files changed there since the task started, by any agent or by you. Deleted files don't show here, but your version control has them.</p>
+      {error && <div className="sys tone-error">{error}</div>}
+      {files === null ? <div className="tab-empty">Scanning…</div> : files.length === 0 ? <div className="tab-empty">No changes.</div> : (
+        <ul className="change-list">
+          {files.map((f) => (
+            <li key={f.path}>
+              <span className={`chg chg-${f.kind}`}>{f.kind[0].toUpperCase()}</span>
+              <span className="chg-path">{f.path}</span>
+              {f.binary && <span className="chg-bin">binary</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="prompt-actions"><button className="btn" onClick={refresh}>Rescan</button></div>
+    </div>
+  );
   return (
     <div className="changes">
-      <p className="changes-note">These edits are only in this agent's private copy. Applying copies them into your real project.</p>
+      <p className="changes-note">{card.slot?.shared
+        ? `These files changed in the project folder on ${getState().snapshot.machines.find((m) => m.info.id === card.nodeId)?.info.name ?? 'that machine'} since the task started, by any agent there. Applying copies them into your project on this machine.`
+        : "These edits are only in this agent's private copy. Applying copies them into your real project."}</p>
       {error && <div className="sys tone-error">{error}</div>}
       {files === null ? <div className="tab-empty">Scanning…</div> : files.length === 0 ? <div className="tab-empty">No changes.</div> : (
         <>
@@ -327,11 +349,12 @@ function LogTab({ card }: { card: AgentCard }) {
   return <pre className="log" ref={ref}>{log || 'No editor log yet. The editor starts when the agent first needs it.'}</pre>;
 }
 
-// Archiving frees the project copy for reuse, which would wipe anything not applied yet.
-async function archive(id: string) {
-  const files = await window.fleet.call<ChangedFile[]>('changes', id).catch(() => [] as ChangedFile[]);
+// Archiving frees a private copy, which would wipe anything not applied yet. Work in a shared folder
+// stays where it is.
+async function archive(card: AgentCard) {
+  const files = card.slot?.shared ? [] : await window.fleet.call<ChangedFile[]>('changes', card.id).catch(() => [] as ChangedFile[]);
   if (files.length && !window.confirm(`${files.length} changed file${files.length === 1 ? ' hasn\'t' : 's haven\'t'} been applied to your project and will be lost. Archive anyway?`)) return;
-  await window.fleet.call('archive', id);
+  await window.fleet.call('archive', card.id);
 }
 
 export function DetailPanel() {
@@ -354,7 +377,7 @@ export function DetailPanel() {
             {live && <button className="link-btn" onClick={() => void window.fleet.call('interrupt', card.id)}>Interrupt <kbd>Esc</kbd></button>}
             {card.slot && !['cold', 'syncing', 'empty', 'crashed'].includes(card.slot.state) && <button className="link-btn" onClick={() => void window.fleet.call('stopInstance', card.id)}>Stop editor</button>}
             {live && <button className="link-btn" onClick={() => void window.fleet.call('stopAgent', card.id)}>Stop</button>}
-            {!live && <button className="link-btn" onClick={() => void archive(card.id)}>Archive</button>}
+            {!live && <button className="link-btn" onClick={() => void archive(card)}>Archive</button>}
           </span>
         </div>
         <nav className="tabs" role="tablist">

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { applyChanges, classify, listChanges, syncProject } from '../src/node/projectSync';
+import { applyChanges, baseText, classify, listChanges, syncProject } from '../src/node/projectSync';
 
 function tmpProject() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-sync-'));
@@ -211,6 +212,50 @@ test('resync of a warm copy only touches what changed', async () => {
   assert.equal(stat.linked, 1);
   assert.ok(stat.skipped >= 5);
   assert.equal(fs.readFileSync(path.join(dst, 'Source/Game/A.cpp'), 'utf8'), 'rewritten\n');
+});
+
+test('the private repo tracks only text and never repacks by itself', async () => {
+  const { src, dst, write } = tmpProject();
+  write('Plugins/Wwise/ThirdParty/x64/lib/AkSoundEngine.lib', 'BIG LIB');
+  write('Plugins/Wwise/ThirdParty/ps5/libAkSoundEngine.a', 'BIG LIB');
+  write('Plugins/Wwise/Source/AkAudio/Ak.h', 'header\n');
+  write('Source/ThirdParty/vendor/tool.exe', 'BIG');
+  write('Source/ThirdParty/vendor/noextension', 'BIG');
+  write('Source/Game/Mac.mm', 'objc\n');
+  write('Wwise/GeneratedSoundBanks/Bank.json', '{}');
+  await syncProject(src, dst);
+  const git = (...a: string[]) => execFileSync('git', ['-C', dst, ...a], { encoding: 'utf8' }).trim();
+  assert.deepEqual(git('ls-files').split('\n').sort(), [
+    'Config/DefaultGame.ini',
+    'Game.uproject',
+    'Plugins/P/Source/P.cpp',
+    'Plugins/Wwise/Source/AkAudio/Ak.h',
+    'Source/Game/A.cpp',
+    'Source/Game/Mac.mm',
+  ]);
+  assert.equal(git('config', 'gc.auto'), '0', "an agent's own commits don't repack either");
+  assert.equal(git('config', 'maintenance.auto'), 'false');
+  assert.equal((await baseText(dst, 'Plugins/Wwise/Source/AkAudio/Ak.h'))?.toString(), 'header\n', 'text still has a merge base');
+  assert.equal(await baseText(dst, 'Plugins/Wwise/ThirdParty/ps5/libAkSoundEngine.a'), null);
+});
+
+test('a copy from before text-only tracking gets a fresh repo', async () => {
+  const { src, dst } = tmpProject();
+  await syncProject(src, dst);
+  const git = (...a: string[]) => execFileSync('git', ['-C', dst, '-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { encoding: 'utf8' }).trim();
+  fs.rmSync(path.join(dst, '.git', 'fleet-text-only'));
+  fs.writeFileSync(path.join(dst, 'Plugins', 'P', 'Fat.lib'), 'BIG LIB');
+  git('add', '-f', 'Plugins/P/Fat.lib');
+  git('commit', '-q', '-m', 'what an older version tracked');
+  await syncProject(src, dst);
+  assert.ok(!git('ls-files').includes('Fat.lib'), 'the libraries are gone from the repo');
+  assert.equal(git('rev-list', '--count', '--all'), '1', 'along with their history');
+  assert.ok(git('ls-files').includes('Source/Game/A.cpp'));
+  const before = git('rev-parse', 'fleet-baseline');
+  await syncProject(src, dst);
+  assert.notEqual(git('rev-parse', 'HEAD'), '', 'a current repo is kept');
+  assert.equal(git('rev-list', '--count', '--all'), '2', 'and only gets a new baseline');
+  assert.notEqual(git('rev-parse', 'fleet-baseline'), before);
 });
 
 test('a read-only source asset gets a real, writable copy', async () => {

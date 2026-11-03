@@ -1,11 +1,12 @@
 // The hub against scripted agents, and a real host process linked over TLS on loopback.
 import assert from 'node:assert/strict';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
-import { Hub, titleFrom } from '../src/hub/hub';
+import { Hub, titleFrom, type HubOptions } from '../src/hub/hub';
+import type { RemoteNode } from '../src/hub/link';
 import { decodePairCode, encodePairCode } from '../src/shared/pair';
 import type { AgentCard, HubEvent, NewTask } from '../src/shared/protocol';
 
@@ -154,8 +155,8 @@ test('state survives a restart', async () => {
   assert.equal(again.testList().length, 2);
 });
 
-function startHost(code: string, dataDir: string) {
-  const p = spawn(process.execPath, [HOST, '--pair', code], { env: { ...process.env, FLEET_HOST_DATA: dataDir }, stdio: ['ignore', 'pipe', 'pipe'] });
+function startHost(code: string, dataDir: string, extraEnv: Record<string, string> = {}) {
+  const p = spawn(process.execPath, [HOST, '--pair', code], { env: { ...process.env, FLEET_HOST_DATA: dataDir, ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '';
   p.stdout!.on('data', (d) => { out += d; });
   p.stderr!.on('data', (d) => { out += d; });
@@ -220,6 +221,104 @@ test('a project pushed to a host arrives and is sent only once', async () => {
   const plan = await (hub as any).nodeCall(machine.info.id, 'project.plan', { name: 'Pushed', manifest: [{ path: 'Content\\Big.uasset', size: big.length, mtime: fs.statSync(path.join(src, 'Content', 'Big.uasset')).mtimeMs }, { path: 'Source\\A.cpp', size: 4, mtime: fs.statSync(path.join(src, 'Source', 'A.cpp')).mtimeMs }, { path: 'Pushed.uproject', size: fs.statSync(path.join(src, 'Pushed.uproject')).size, mtime: fs.statSync(path.join(src, 'Pushed.uproject')).mtimeMs }] });
   assert.deepEqual(plan, [], 'a second push has nothing to send');
   assert.equal(fs.statSync(path.join(landed, 'Content', 'Big.uasset')).mtimeMs, mtimeBefore);
+  host.p.kill();
+});
+
+// A project on the master, and a host whose user folder holds nothing of this machine's.
+async function hostAndProject(hubOptions: Partial<HubOptions> = {}, size = 3_500_000) {
+  const hub = new Hub({ dataDir: tmp('fleet-hub-'), version: 'test', demo: true, hostAppPath: null, ...hubOptions });
+  hubs.push(hub);
+  await hub.start();
+  const code = encodePairCode({ ...decodePairCode(hub.snapshot().pairing!.code), a: ['127.0.0.1'] });
+  const dir = tmp('fleet-host-');
+  const home = tmp('fleet-home-');
+  const hostEnv = { USERPROFILE: home, APPDATA: path.join(home, 'roaming'), LOCALAPPDATA: path.join(home, 'local') };
+  const host = startHost(code, dir, hostEnv);
+  const machine = await until(() => hub.machines().find((m) => m.info.role === 'remote' && m.online), 'host to connect', 25_000);
+  const src = path.join(tmp('fleet-src-'), 'Sent Game');
+  fs.mkdirSync(path.join(src, 'Content'), { recursive: true });
+  fs.writeFileSync(path.join(src, 'Sent.uproject'), '{"EngineAssociation":"5.8"}');
+  fs.writeFileSync(path.join(src, 'Content', 'Big.uasset'), Buffer.alloc(size, 7));
+  return { hub, host, machine, dir, home, hostEnv, projectFile: path.join(src, 'Sent.uproject'), landed: path.join(dir, 'projects', 'Sent') };
+}
+
+test('a copy already on the host is found without restarting it, and nothing is sent', async () => {
+  const { hub, host, machine, home, projectFile, landed, dir, hostEnv } = await hostAndProject();
+  // Created after the host started, as a fresh workspace would be.
+  const wkspace = path.join(home, 'wkspaces', 'Sent Game_2');
+  fs.mkdirSync(wkspace, { recursive: true });
+  fs.writeFileSync(path.join(wkspace, 'SENT.uproject'), '{"EngineAssociation":"5.8"}');
+
+  const id = await hub.createAgent(task('clean', { nodeId: machine.info.id, projectFile }));
+  await until(() => cardOf(hub, id).status === 'finished', 'agent to finish', 30_000);
+  assert.ok(hub.transcript(id).some((t) => t.kind === 'system' && t.text.includes('Using the copy') && t.text.includes(wkspace)), 'the card says which copy it used');
+  assert.ok(!fs.existsSync(landed), 'nothing was sent');
+
+  // Pinning from another terminal reaches the running host, and survives what it writes itself.
+  const pinned = path.join(home, 'Somewhere Else');
+  fs.mkdirSync(pinned);
+  fs.writeFileSync(path.join(pinned, 'Sent.uproject'), '{"EngineAssociation":"5.8"}');
+  const pin = spawnSync(process.execPath, [HOST, '--project', pinned], { env: { ...process.env, FLEET_HOST_DATA: dir, ...hostEnv }, encoding: 'utf8' });
+  assert.equal(pin.status, 0, pin.stderr);
+  (hub.link.nodes.get(machine.info.id) as RemoteNode).ws!.terminate();
+  await until(() => !hub.machines().find((m) => m.info.id === machine.info.id)!.online, 'disconnect');
+  await until(() => hub.machines().find((m) => m.info.id === machine.info.id)!.online, 'reconnect', 25_000);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8')).projects, [path.join(pinned, 'Sent.uproject')], 'reconnecting keeps the pin');
+
+  const again = await hub.createAgent(task('clean', { nodeId: machine.info.id, projectFile }));
+  await until(() => cardOf(hub, again).status === 'finished', 'agent to finish', 30_000);
+  const note = hub.transcript(again).find((t) => t.kind === 'system' && t.text.includes('Using the copy')) as any;
+  assert.ok(note.text.includes(`already on ${machine.info.name}: ${pinned}`), `a pinned copy comes first: ${note.text}`);
+  assert.ok(note.text.includes('Also found') && note.text.includes(wkspace), `and the card mentions the other: ${note.text}`);
+  assert.ok(!fs.existsSync(landed));
+  host.p.kill();
+});
+
+test('a large send asks first, and answering no sends nothing until a message tries again', async () => {
+  const { hub, host, machine, projectFile, landed } = await hostAndProject({ askBeforeSendingBytes: 1024 });
+  const id = await hub.createAgent(task('clean', { nodeId: machine.info.id, projectFile }));
+  await until(() => cardOf(hub, id).attention?.kind === 'question', 'the question');
+  assert.match(cardOf(hub, id).attention!.text, /Send 3 MB of Sent to/);
+  assert.ok(!fs.existsSync(path.join(landed, 'Content', 'Big.uasset')), 'nothing moves before the answer');
+
+  await hub.answer(id, cardOf(hub, id).attention!.ref!, { q: "Don't send" });
+  assert.equal(cardOf(hub, id).status, 'stopped');
+  assert.equal(cardOf(hub, id).attention, null);
+  await sleep(300);
+  assert.ok(!fs.existsSync(path.join(landed, 'Content', 'Big.uasset')));
+
+  await hub.send(id, 'Try again now');
+  await until(() => cardOf(hub, id).attention?.kind === 'question', 'the question again');
+  await hub.answer(id, cardOf(hub, id).attention!.ref!, { q: 'Send it' });
+  await until(() => cardOf(hub, id).status === 'finished', 'agent to finish', 30_000);
+  assert.equal(fs.statSync(path.join(landed, 'Content', 'Big.uasset')).size, 3_500_000);
+  assert.ok(hub.transcript(id).some((t) => t.kind === 'user' && t.text.includes('Try again now')), 'what was said reaches the agent');
+  host.p.kill();
+});
+
+test('a small send does not ask', async () => {
+  const { hub, host, machine, projectFile, landed } = await hostAndProject();
+  const id = await hub.createAgent(task('clean', { nodeId: machine.info.id, projectFile }));
+  await until(() => cardOf(hub, id).status === 'finished', 'agent to finish', 30_000);
+  assert.ok(!hub.transcript(id).some((t) => t.kind === 'question'));
+  assert.ok(fs.existsSync(path.join(landed, 'Sent.uproject')));
+  host.p.kill();
+});
+
+test('stopping a card stops its transfer, and no agent starts afterwards', async () => {
+  const { hub, host, machine, projectFile, landed } = await hostAndProject({}, 300 * 1024 * 1024);
+  const id = await hub.createAgent(task('clean', { nodeId: machine.info.id, projectFile }));
+  await until(() => /Sending project: [1-9]/.test(cardOf(hub, id).detail ?? ''), 'the transfer to start', 20_000);
+  await hub.stopAgent(id);
+  assert.equal(cardOf(hub, id).status, 'stopped');
+  const part = path.join(landed, 'Content', 'Big.uasset.part');
+  await sleep(500);
+  const sizeAfterStop = fs.existsSync(part) ? fs.statSync(part).size : 0;
+  await sleep(1500);
+  assert.equal(fs.existsSync(part) ? fs.statSync(part).size : 0, sizeAfterStop, 'nothing more arrives');
+  assert.ok(!fs.existsSync(path.join(landed, 'Content', 'Big.uasset')), 'the file never finished');
+  assert.equal(cardOf(hub, id).status, 'stopped', 'and no agent started');
+  assert.ok(!hub.transcript(id).some((t) => t.kind === 'assistant'));
   host.p.kill();
 });
 

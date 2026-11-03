@@ -50,6 +50,34 @@ try {
   check('both machines are listed', strip === 2, strip);
   fs.mkdirSync(shots, { recursive: true });
   await page.screenshot({ path: path.join(shots, '10-packaged-linked.png') });
+
+  // A real 1.1 GB file, not a test setting, so this is the threshold that ships. Answering no never
+  // moves it, and with no file data written it costs almost nothing.
+  await page.evaluate((i) => window.fleet.call('dismissAttention', i), id);
+  const big = path.join(tmp('fleet-pkg-big-'), 'BigSendProbe');
+  fs.mkdirSync(path.join(big, 'Content'), { recursive: true });
+  fs.writeFileSync(path.join(big, 'BigSendProbe.uproject'), '{"EngineAssociation":"5.8"}');
+  const fd = fs.openSync(path.join(big, 'Content', 'Big.uasset'), 'w');
+  fs.ftruncateSync(fd, Math.floor(1.1 * 2 ** 30));
+  fs.closeSync(fd);
+  const bigId = await page.evaluate(([nodeId, projectFile]) => window.fleet.call('createAgent', { prompt: 'Needs a big project', projectFile, nodeId, model: 'claude-opus-5-5', effort: 'low', permissionMode: 'default', instanceMode: 'headless', demo: 'clean' }), [machine.info.id, path.join(big, 'BigSendProbe.uproject')]);
+  await until(() => page.evaluate((i) => document.querySelector('.popup')?.dataset.popup === i, bigId), 'the popup asking to send').catch(async (e) => {
+    const card = await page.evaluate((i) => window.fleet.call('snapshot').then((s) => s.cards.find((c) => c.id === i)), bigId);
+    throw new Error(`${e.message}: status ${card?.status}, detail ${card?.detail}, attention ${JSON.stringify(card?.attention)}, popup ${await page.evaluate(() => document.querySelector('.popup')?.innerText)}`);
+  });
+  const popupText = await page.evaluate(() => document.querySelector('.popup').innerText);
+  check('a large send asks first, with its size', popupText.includes('1.1 GB') && popupText.includes('BigSendProbe'), popupText);
+  await page.screenshot({ path: path.join(shots, '11-ask-before-sending.png') });
+  await page.keyboard.press('Tab');
+  await page.waitForSelector('[data-question]');
+  const choices = await page.evaluate(() => [...document.querySelectorAll('[data-question] .q-option')].map((b) => b.innerText));
+  check('it offers sending or not', choices[0]?.includes('Send it') && choices[1]?.includes("Don't send"), choices);
+  await page.click('[data-composer]');
+  await page.keyboard.press('2');
+  await until(() => page.evaluate((i) => document.querySelector(`[data-card="${i}"]`)?.classList.contains('s-stopped'), bigId), 'the card to stop');
+  check('answering no with a key press stops the card', true);
+  const received = path.join(clean.FLEET_HOST_DATA, 'projects', 'BigSendProbe', 'Content', 'Big.uasset');
+  check('and the file was never sent', !fs.existsSync(received) && !fs.existsSync(`${received}.part`));
 } catch (e) {
   results.push(`FAIL ${e.message}`);
   console.log('FAIL', e.message);
