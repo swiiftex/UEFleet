@@ -1,6 +1,6 @@
 // A scripted stand-in for a real agent. Lets the whole UI and the attention flow be exercised
 // without spending tokens or booting Unreal: run with FLEET_DEMO=1, or in the automated tests.
-import type { AgentEvent, AgentSpawn, ImageAttachment } from '../shared/protocol';
+import type { AgentEvent, AgentOptions, AgentSpawn, ImageAttachment } from '../shared/protocol';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -129,6 +129,8 @@ export class DemoRunner {
   }
   decide(itemId: string, _d: string) { this.emit({ k: 'attention-clear', ref: itemId }); this.waiters.get(itemId)?.(); this.waiters.delete(itemId); }
   answer(itemId: string, _a: Record<string, string>) { this.emit({ k: 'attention-clear', ref: itemId }); this.waiters.get(itemId)?.(); this.waiters.delete(itemId); }
+  async setOptions(_o: AgentOptions) {}
+  useCredits(_apiKey: string | null, carryOn?: string) { if (carryOn) this.send(carryOn); }
   async interrupt() { this.stopped = true; this.emit({ k: 'turn-end', interrupted: true }); }
   stop() { this.stopped = true; }
 }

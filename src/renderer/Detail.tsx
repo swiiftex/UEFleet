@@ -1,7 +1,7 @@
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { modelLabel, type AgentCard, type ChangedFile, type FinalReport, type ImageAttachment, type Question, type TranscriptItem } from '../shared/protocol';
+import { MASTER_PERMISSION_MODES, modelLabel, type AgentCard, type ChangedFile, type FinalReport, type ImageAttachment, type Question, type TranscriptItem } from '../shared/protocol';
 import { FlowSteps, isLive, stageLabel } from './Cards';
 import { fmtDuration, getState, isMessage, pad2, setMessagesOnly, useStore } from './store';
 
@@ -156,7 +156,7 @@ function flowText(c: AgentCard, machine: string) {
       if (inPlace) return 'Your turn to test. Its files are already in your workspace.';
       return merged ? `Your turn to test. ${plural(merged, 'file')} from ${machine} are in your workspace.` : `Your turn to test. Its files are still in ${where ?? machine}. Open editor brings them into your workspace first.`;
     case 'awaiting-merge':
-      if (c.merge?.conflicts?.length) return `Paused: ${plural(c.merge.conflicts.length, 'file')} also changed in your workspace. Choose which to keep.`;
+      if (c.merge?.conflicts?.length) return `Paused: ${plural(c.merge.conflicts.length, 'file')} couldn't be merged with your workspace. Choose which to keep.`;
       if (c.merge?.error) return `Paused: couldn't merge. ${c.merge.error}`;
       return `Approved. Bringing its files from ${where ?? machine} into your workspace.`;
     case 'merged': return `${plural(merged, 'file')} are in your workspace.`;
@@ -170,8 +170,8 @@ function flowText(c: AgentCard, machine: string) {
 
 const TEST_RUN_TEXT: Record<NonNullable<AgentCard['testRun']>['stage'], string> = {
   pulling: 'Bringing its files into your workspace…',
-  building: 'Compiling…',
-  opening: 'Opening the editor…',
+  building: "Compiling… If the engine is out of date this rebuilds the editor too, which takes longer.",
+  opening: "Opening the editor, after compiling if it's out of date…",
   open: "The editor is opening in its own window. It's a real editor with your settings, so you can change things in it.",
   'already-open': "You already have an editor open on this project. Close it and press Open editor again to load these changes, because it keeps the code it started with.",
   failed: "That didn't work:",
@@ -234,8 +234,9 @@ function FlowPanel({ card }: { card: AgentCard }) {
         <div className="conflicts" data-conflicts>
           <ul className="change-list">{conflicts.map((c) => <li key={c.path}><span className="chg-path">{c.path}</span><small>{c.reason}</small></li>)}</ul>
           <div className="prompt-actions">
-            <button className="btn primary" onClick={() => void window.fleet.call('resolveConflicts', card.id, 'agent')} data-use-agents>Use the agent's version</button>
+            <button className="btn primary" onClick={() => void window.fleet.call('resolveConflicts', card.id, 'agent')} data-use-agents>Use the agent's changes</button>
             <button className="btn" onClick={() => void window.fleet.call('resolveConflicts', card.id, 'mine')} data-keep-mine>Keep mine</button>
+            <button className="btn" onClick={() => void window.fleet.call('resolveConflicts', card.id, 'retry')} data-retry-merge>Try merging again</button>
           </div>
         </div>
       )}
@@ -387,6 +388,8 @@ function LogTab({ card }: { card: AgentCard }) {
   return <pre className="log" ref={ref}>{log || 'No editor log yet. The editor starts when the agent first needs it.'}</pre>;
 }
 
+const PERMISSION_TEXT: Record<string, string> = { auto: 'auto', acceptEdits: 'accepts edits', default: 'asks', bypassPermissions: 'bypass' };
+
 // Archiving frees a private copy, which would wipe anything not merged yet. Work in a shared folder
 // stays where it is.
 async function archive(card: AgentCard) {
@@ -410,6 +413,11 @@ export function DetailPanel() {
         <div className="detail-title">{!card.isMaster && <span className="card-num">{pad2(card.index)}</span>} {card.title}{!card.isMaster && <span className="card-status">{stageLabel(card)}</span>}</div>
         <div className="detail-sub">
           <span>{modelLabel(card.model)} @{card.effort}</span>
+          {card.isMaster ? (
+            <select className="mode-select" data-master-mode aria-label="Master chat permissions" value={card.permissionMode} onChange={(e) => void window.fleet.call('setMasterPermissions', e.target.value)}>
+              {MASTER_PERMISSION_MODES.map((m) => <option key={m} value={m}>{PERMISSION_TEXT[m]}</option>)}
+            </select>
+          ) : <span data-permissions>{PERMISSION_TEXT[card.permissionMode] ?? card.permissionMode}</span>}
           <span>{getState().snapshot.machines.find((m) => m.info.id === card.nodeId)?.info.name}</span>
           {card.project && <span>{card.project}</span>}
           {card.slot && <span title={card.slot.dir}>UE :{card.slot.port} {card.slot.state}</span>}
@@ -432,7 +440,13 @@ export function DetailPanel() {
           )}
         </div>
       </header>
-      {!card.isMaster && <FlowPanel card={card} />}
+      {card.isWorkspace && (
+        <div className="workspace-banner" data-workspace-banner>
+          {card.holdingWorkspace ? 'Other agents on this project are paused while this chat changes the workspace.' : "This chat can merge, switch and update your real workspace. It asks before touching anyone's pending changes, and it doesn't check in unless you say to."}
+          {card.holdingWorkspace && <button className="btn" data-release onClick={() => void window.fleet.call('releaseWorkspace', card.id)}>Let agents carry on</button>}
+        </div>
+      )}
+      {!card.isMaster && !card.isWorkspace && <FlowPanel card={card} />}
       {tab === 'chat' && <Transcript card={card} />}
       {tab === 'files' && <FilesTab card={card} />}
       {tab === 'log' && <LogTab card={card} />}

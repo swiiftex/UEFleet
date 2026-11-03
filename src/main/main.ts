@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Notification, shell } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Notification, safeStorage, shell } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Hub, type LocalHostCommand } from '../hub/hub';
@@ -14,7 +14,7 @@ if (process.env.FLEET_DATA) app.setPath('userData', path.join(dataDir, 'window')
 const CALLABLE = new Set([
   'snapshot', 'createAgent', 'request', 'send', 'broadcast', 'decide', 'answer', 'interrupt', 'stopAgent', 'archive',
   'dismissAttention', 'transcript', 'setTestDone', 'addProject', 'setMaxInstances', 'rotatePairing',
-  'forgetMachine', 'changes', 'log', 'stopInstance', 'testChanges', 'approve', 'reportIssue', 'resolveConflicts', 'restartHost',
+  'forgetMachine', 'changes', 'log', 'stopInstance', 'testChanges', 'approve', 'reportIssue', 'resolveConflicts', 'restartHost', 'setApiCreditsEnabled', 'releaseWorkspace', 'setMasterPermissions',
 ]);
 
 let win: BrowserWindow | null = null;
@@ -83,6 +83,30 @@ async function applyUpdate() {
   await win?.loadFile(path.join(versionsDir, version.id, 'renderer', 'index.html'));
 }
 
+// ---- The API key ----
+// Encrypted for this Windows account, and never passed back to the screens.
+
+const apiKeyFile = path.join(dataDir, 'api-key.bin');
+
+function savedApiKey() {
+  try { return safeStorage.decryptString(fs.readFileSync(apiKeyFile)); } catch { return null; }
+}
+
+// It says whether the key works, without spending anything. Only the Console shows the balance.
+async function setApiKey(key: string | null): Promise<string | null> {
+  if (key) {
+    const base = process.env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com';
+    const res = await fetch(`${base}/v1/models?limit=1`, { headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' } }).catch(() => null);
+    if (res?.status === 401 || res?.status === 403) return 'Anthropic refused that key.';
+    if (!safeStorage.isEncryptionAvailable()) return "Windows can't encrypt the key on this PC, so it wasn't saved.";
+    fs.writeFileSync(apiKeyFile, safeStorage.encryptString(key));
+  } else {
+    fs.rmSync(apiKeyFile, { force: true });
+  }
+  hub.setApiKey(key);
+  return null;
+}
+
 function createWindow() {
   // For tests on a PC someone is using: it still renders, but stays off screen and never takes focus.
   const unseen = process.env.FLEET_TEST_UNSEEN === '1';
@@ -117,6 +141,7 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   hub = new Hub({ dataDir, version: VERSION, demo, hostAppPath: hostAppPath(), localHost: localHost() });
+  hub.setApiKey(savedApiKey());
   hub.on('hub', (e: HubEvent) => win?.webContents.send('hub:event', e));
   hub.on('attention', (card: AgentCard) => {
     if (!win || win.isFocused() || !card.attention) return;
@@ -142,6 +167,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('app:copy', (_e, text: string) => clipboard.writeText(text));
   ipcMain.handle('app:reveal', (_e, p: string) => shell.showItemInFolder(p));
   ipcMain.handle('app:applyUpdate', () => applyUpdate());
+  ipcMain.handle('app:setApiKey', (_e, key: string | null) => setApiKey(key));
 
   await hub.start();
   createWindow();

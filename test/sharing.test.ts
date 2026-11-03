@@ -6,9 +6,9 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { Hub } from '../src/hub/hub';
 import { appendPrompt } from '../src/node/fleetTools';
-import { SlotManager } from '../src/node/instance';
+import { engineFilesToReplace, SlotManager } from '../src/node/instance';
 import { readProject } from '../src/node/machine';
-import { changedSince, freeLoadedModules, listChanges } from '../src/node/projectSync';
+import { changedSince, freeFiles, freeLoadedModules, listChanges } from '../src/node/projectSync';
 import type { EngineInfo } from '../src/shared/protocol';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -39,6 +39,84 @@ function fakeEngine(root: string, seconds = 2): EngineInfo {
   fs.copyFileSync('C:\\Windows\\System32\\whoami.exe', path.join(dir, 'Engine/Binaries/Win64/UnrealEditor.exe'));
   return { id: '5.8', version: '5.8.0', root: dir, hasMcp: false, source: false };
 }
+
+// Refuses while told not to change the engine, the way UnrealBuildTool does when a source engine is out of date.
+function outOfDateEngine(root: string): EngineInfo {
+  const engine = fakeEngine(root);
+  const log = path.join(root, 'attempts.log');
+  fs.writeFileSync(path.join(engine.root, 'Engine/Build/BatchFiles/Build.bat'), [
+    '@echo off', `echo %*>>"${log}"`,
+    'echo %* | findstr /c:"-NoEngineChanges" >nul', 'if errorlevel 1 goto build',
+    'echo Building would modify the following existing engine files:', `echo ${path.join(engine.root, 'Engine/Binaries/Win64/UnrealEditor-NetCore.dll')}`, 'echo.',
+    'echo Please build from an IDE instead.', 'echo Result: Failed (FailedDueToEngineChange)', 'exit /b 8',
+    ':build', 'echo Result: Succeeded', 'exit /b 0', '',
+  ].join('\r\n'));
+  return { ...engine, source: true };
+}
+const attempts = (root: string) => fs.readFileSync(path.join(root, 'attempts.log'), 'utf8').trim().split(/\r?\n/);
+
+test('a build refused because the engine is out of date rebuilds the editor, from the real project', async () => {
+  const { root, project, mgr } = setup();
+  const a = await mgr.acquire(project, outOfDateEngine(root), 'a', 'headless');
+  const r = await a.build({});
+  assert.ok(r.ok, r.output);
+  const tried = attempts(root);
+  assert.equal(tried.length, 2);
+  assert.match(tried[0], /-NoEngineChanges/);
+  assert.doesNotMatch(tried[1], /-NoEngineChanges/);
+  assert.match(r.output, /the editor was rebuilt/);
+});
+
+test('a copy is never allowed to rebuild the engine, because it would tie the engine to its own path', async () => {
+  const { root, project, mgr } = setup();
+  const a = await mgr.acquire({ ...project, received: true }, outOfDateEngine(root), 'a', 'headless');
+  assert.equal(a.shared, false);
+  const r = await a.build({});
+  assert.equal(r.ok, false);
+  assert.equal(attempts(root).length, 1);
+  assert.match(r.output, /FailedDueToEngineChange/);
+});
+
+test('only the engine files a refused build lists get freed, even ones in use', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-engine-'));
+  const inUse = path.join(dir, 'UnrealEditor-NetCore.exe');
+  const notListed = path.join(dir, 'UnrealEditor-Core.exe');
+  fs.copyFileSync(process.execPath, inUse);
+  fs.copyFileSync(process.execPath, notListed);
+  fs.writeFileSync(path.join(dir, 'Old.dll.fleet-old-abc'), 'left by an earlier build');
+  const running = [inUse, notListed].map((exe) => spawn(exe, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' }));
+  try {
+    await sleep(1000);
+    assert.throws(() => fs.writeFileSync(inUse, 'x'), 'it really is locked');
+    const listed = engineFilesToReplace(`Building would modify the following existing engine files:\r\n${inUse}\r\n\r\nPlease build from an IDE instead.\r\nResult: Failed (FailedDueToEngineChange)\r\nTrace written to file ${dir}\\Trace.uba`);
+    assert.deepEqual(listed, [inUse]);
+    await freeFiles(listed);
+    const left = fs.readdirSync(dir);
+    assert.ok(left.some((f) => /^UnrealEditor-NetCore\.exe\.fleet-old-/.test(f)), 'moved aside');
+    assert.ok(!left.some((f) => f.startsWith('UnrealEditor-Core.exe.')), 'and nothing else');
+    assert.ok(!left.includes('Old.dll.fleet-old-abc'), 'what an earlier build left has gone');
+    fs.writeFileSync(inUse, 'the new one');
+    assert.throws(() => fs.writeFileSync(notListed, 'x'));
+  } finally {
+    for (const p of running) p.kill();
+  }
+});
+
+test('the test editor knows when the project was built for a different build of the engine', async () => {
+  const { root, src, write, project, mgr } = setup();
+  const engine = fakeEngine(root);
+  const a = await mgr.acquire(project, engine, 'a', 'headless');
+  const modules = (id: string) => JSON.stringify({ BuildId: id, Modules: {} });
+  fs.writeFileSync(path.join(engine.root, 'Engine/Binaries/Win64/UnrealEditor.modules'), modules('new'));
+  assert.equal(a.binariesOutOfDate(), true, 'never built');
+  write('Binaries/Win64/UnrealEditor.modules', modules('old'));
+  assert.equal(a.binariesOutOfDate(), true);
+  write('Binaries/Win64/UnrealEditor.modules', modules('new'));
+  assert.equal(a.binariesOutOfDate(), false);
+  fs.rmSync(path.join(src, 'Binaries'), { recursive: true });
+  fs.rmSync(path.join(src, 'Source'), { recursive: true });
+  assert.equal(a.binariesOutOfDate(), false, 'a project with no code has nothing to compile');
+});
 
 test('agents work in the project folder itself, each with a place of its own', async () => {
   const { src, project, mgr } = setup();
@@ -267,25 +345,26 @@ test('bringing work back from a shared folder on another machine leaves a file t
   const old = new Date(Date.now() - 60_000);
   fs.utimesSync(untouched, old, old);
   const id = 'remote-card';
-  const rec = { card: { id, nodeId: 'laptop', project: 'Game', createdAt: Date.now() - 30_000, slot: { shared: true } }, spawn: {}, sourceProjectDir: dest };
+  const rec = { card: { id, nodeId: 'laptop', project: 'Game', createdAt: Date.now() - 30_000, slot: { shared: true } }, spawn: {}, sourceProjectDir: dest, pendingItems: new Map(), pendingDeltas: new Map(), byId: new Map(), transcript: [] };
   (hub as any).agents.set(id, rec);
   const content: Record<string, string> = { 'Untouched.cpp': 'from the laptop', 'ChangedHere.cpp': 'from the laptop' };
   (hub as any).nodeCall = async (_node: string, method: string, p: any) => {
     if (method === 'agent.changes') return Object.keys(content).map((f) => ({ path: f, kind: 'modified', binary: false }));
     if (method === 'agent.readFile') return { data: Buffer.from(content[p.path]).toString('base64'), last: true, mtime: Date.now() };
-    if (method === 'agent.baseText') return null;
+    if (method === 'agent.baseText') return p.path === 'Untouched.cpp' ? Buffer.from('old').toString('base64') : null;
     throw new Error(`Unexpected ${method}`);
   };
   try {
     const first = await hub.apply(id);
-    assert.deepEqual(first.applied, ['Untouched.cpp']);
+    assert.deepEqual(first.merged, ['Untouched.cpp']);
     assert.deepEqual(first.conflicts.map((c) => c.path), ['ChangedHere.cpp']);
     assert.equal(fs.readFileSync(changedHere, 'utf8'), 'edited on this machine');
     assert.equal(fs.readFileSync(untouched, 'utf8'), 'from the laptop');
 
     content['Untouched.cpp'] = 'from the laptop again';
     const second = await hub.apply(id);
-    assert.deepEqual(second.applied, ['Untouched.cpp'], "applying it earlier doesn't count as changing it here");
+    assert.deepEqual(second.merged, ['Untouched.cpp'], "applying it earlier doesn't count as changing it here");
+    assert.deepEqual(second.conflicts.map((c) => c.path), ['ChangedHere.cpp']);
     assert.equal(fs.readFileSync(untouched, 'utf8'), 'from the laptop again');
 
     const forced = await hub.apply(id, ['ChangedHere.cpp'], ['ChangedHere.cpp']);

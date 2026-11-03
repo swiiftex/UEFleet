@@ -223,7 +223,8 @@ async function replaceFile(from: string, to: string) {
   await fsp.rename(tmp, to);
 }
 
-export async function mergeText(ours: string, base: Buffer, theirs: string): Promise<{ clean: boolean; text: Buffer }> {
+// With favorTheirs, lines both sides changed go their way, and everything else from both sides stays.
+export async function mergeText(ours: string, base: Buffer, theirs: string, favorTheirs = false): Promise<{ clean: boolean; text: Buffer }> {
   const dir = await fsp.mkdtemp(path.join(path.dirname(theirs), '.fleet-merge-'));
   try {
     const [a, b, c] = ['ours', 'base', 'theirs'].map((n) => path.join(dir, n));
@@ -231,7 +232,7 @@ export async function mergeText(ours: string, base: Buffer, theirs: string): Pro
     await fsp.writeFile(b, base);
     await fsp.copyFile(theirs, c);
     try {
-      const { stdout } = await exec('git', ['merge-file', '-p', a, b, c], { windowsHide: true, maxBuffer: 1 << 28, encoding: 'buffer' });
+      const { stdout } = await exec('git', ['merge-file', '-p', ...(favorTheirs ? ['--theirs'] : []), a, b, c], { windowsHide: true, maxBuffer: 1 << 28, encoding: 'buffer' });
       return { clean: true, text: stdout };
     } catch (e: any) {
       return { clean: false, text: e.stdout ?? Buffer.alloc(0) };
@@ -342,27 +343,44 @@ async function moduleFolders(projectDir: string): Promise<string[]> {
 
 const isLoaded = (file: string) => fsp.open(file, 'r+').then((h) => h.close().then(() => false), () => true);
 
+const LEFT_BY_A_BUILD = /\.fleet-(old-\w+|new)$/;
+
 // Windows lets a loaded DLL be renamed but not overwritten, so each one is swapped for an unlocked
 // copy. The linker can then replace it, and editors already running carry on with what they loaded,
 // the user's own included. The copy keeps the file's date, so a build doesn't think it's out of date.
+async function swapIfLoaded(file: string) {
+  if (!/\.(dll|exe|pdb)$/i.test(file) || !(await isLoaded(file))) return;
+  const fresh = `${file}.fleet-new`;
+  try {
+    await fsp.copyFile(file, fresh);
+    await fsp.rename(file, `${file}.fleet-old-${crypto.randomBytes(3).toString('hex')}`);
+    await fsp.rename(fresh, file);
+  } catch {
+    // The build's own error says more than this could.
+    await fsp.rm(fresh, { force: true }).catch(() => {});
+  }
+}
+
 export async function freeLoadedModules(projectDir: string) {
   for (const folder of await moduleFolders(projectDir)) {
     for (const name of await fsp.readdir(folder).catch(() => [] as string[])) {
       const file = path.join(folder, name);
       // One left by an earlier build goes once nothing has it loaded any more.
-      if (/\.fleet-(old-\w+|new)$/.test(name)) { await fsp.rm(file, { force: true }).catch(() => {}); continue; }
-      if (!/\.(dll|exe|pdb)$/i.test(name) || !(await isLoaded(file))) continue;
-      const fresh = `${file}.fleet-new`;
-      try {
-        await fsp.copyFile(file, fresh);
-        await fsp.rename(file, `${file}.fleet-old-${crypto.randomBytes(3).toString('hex')}`);
-        await fsp.rename(fresh, file);
-      } catch {
-        // The build's own error says more than this could.
-        await fsp.rm(fresh, { force: true }).catch(() => {});
-      }
+      if (LEFT_BY_A_BUILD.test(name)) await fsp.rm(file, { force: true }).catch(() => {});
+      else await swapIfLoaded(file);
     }
   }
+}
+
+// The same for particular files, such as the engine's own when a build is about to replace them.
+// An engine has far too many modules to look through them all.
+export async function freeFiles(files: string[]) {
+  for (const folder of new Set(files.map((f) => path.dirname(f)))) {
+    for (const name of await fsp.readdir(folder).catch(() => [] as string[])) {
+      if (LEFT_BY_A_BUILD.test(name)) await fsp.rm(path.join(folder, name), { force: true }).catch(() => {});
+    }
+  }
+  for (const file of files) await swapIfLoaded(file);
 }
 
 // ---- Pushing a project to another machine ----

@@ -1,6 +1,8 @@
 // A task's whole way through: the master chat, placement, the stages, testing, merging and the
 // Plastic changelist, with scripted agents and a stand-in for Plastic's cm.
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,6 +12,8 @@ import { placeTask } from '../src/hub/placement';
 import { Slot, SlotManager, personEditors } from '../src/node/instance';
 import { readProject } from '../src/node/machine';
 import { assignToChangelist, parseStatus, type CmRun } from '../src/node/plastic';
+import { readChunk } from '../src/node/projectSync';
+import { checkedInVersion } from '../src/node/sourceControl';
 import { MASTER_CHAT_ID, type AgentCard, type EngineInfo, type MachineView, type NewTask } from '../src/shared/protocol';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -98,6 +102,448 @@ test('a new request goes through the master chat, which starts the agent', async
   assert.ok(hub.transcript(MASTER_CHAT_ID).some((t) => t.kind === 'user' && t.text.startsWith('Fix the lantern')));
   assert.equal(cardOf(hub, MASTER_CHAT_ID).isMaster, true);
   assert.equal(cardOf(hub, id).isMaster, undefined);
+});
+
+test('agents the master starts run on auto, and another pick lasts for that request only', async () => {
+  const dataDir = tmp('fleet-flow-');
+  // Left behind by a version that remembered the last pick.
+  fs.writeFileSync(path.join(dataDir, 'state.json'), JSON.stringify({ defaults: { model: 'claude-haiku-5-5', effort: 'low', permissionMode: 'acceptEdits', instanceMode: 'headless', projectFile: null } }));
+  const hub = new Hub({ dataDir, version: 'test', demo: true, hostAppPath: null });
+  hubs.push(hub);
+  const started: string[] = [];
+  hub.on('hub', (e) => { if (e.e === 'task-started') started.push(e.id); });
+  assert.equal(hub.snapshot().defaults.permissionMode, 'auto');
+  await hub.send(MASTER_CHAT_ID, 'Fix the lantern');
+  const typed = await until(() => started[0], 'a task typed into the master chat');
+  assert.equal(cardOf(hub, typed).permissionMode, 'auto');
+  await hub.request(task('clean', { prompt: 'Fix the gate' }));
+  const picked = await until(() => started[1], 'a task with its own pick');
+  assert.equal(cardOf(hub, picked).permissionMode, 'default');
+  assert.equal(hub.snapshot().defaults.permissionMode, 'auto', "the pick isn't remembered");
+});
+
+test('the master chat changes running agents by number, and one bad number leaves the rest alone', async () => {
+  const hub = makeHub();
+  const act = (hub as any).masterActions();
+  const rec = (id: string) => (hub as any).agents.get(id);
+  const id = await hub.createAgent(task('long'));
+  const n = cardOf(hub, id).index;
+  await until(() => (hub as any).local.agents.get(id)?.runner, 'the agent to start');
+
+  const said = await act.setAgentOptions({ agents: [n, 99], model: 'claude-sonnet-5-5', effort: 'xhigh', permission_mode: 'auto' });
+  assert.match(said, new RegExp(`0?${n}: changed`));
+  assert.match(said, /99: There's no agent 99/);
+  const { model, effort, permissionMode } = cardOf(hub, id);
+  assert.deepEqual({ model, effort, permissionMode }, { model: 'claude-sonnet-5-5', effort: 'xhigh', permissionMode: 'auto' });
+  assert.equal(rec(id).spawn.effort, 'xhigh', 'so a restart picks it back up on these');
+  assert.equal((hub as any).local.agents.get(id).spawn.model, 'claude-sonnet-5-5', 'so its machine has them too');
+  await act.setAgentOptions({ agents: [n], effort: 'low' });
+  assert.equal(cardOf(hub, id).model, 'claude-sonnet-5-5', 'what is not mentioned stays');
+  assert.equal(cardOf(hub, id).effort, 'low');
+  assert.equal(act.agents()[0].permissions, 'auto');
+  await assert.rejects(() => act.setAgentOptions({ agents: [n] }), /Pass a model/);
+
+  // A host from before this can't change a running agent, but it still applies when the agent next starts.
+  const realCall = (hub as any).nodeCall;
+  (hub as any).nodeCall = async () => { throw new Error('Unknown method agent.setOptions'); };
+  assert.match(await act.setAgentOptions({ agents: [n], effort: 'high' }), /saved for when it next runs/);
+  (hub as any).nodeCall = realCall;
+  assert.equal(rec(id).spawn.effort, 'high');
+
+  assert.match(await act.stopAgents({ agents: [n] }), /stopped/);
+  assert.equal(cardOf(hub, id).status, 'stopped');
+  assert.equal(cardOf(hub, id).archived, undefined, 'stopping keeps the card');
+});
+
+test('the master chat asks before archiving work that would be lost', async () => {
+  const hub = makeHub();
+  const act = (hub as any).masterActions();
+  const id = await hub.createAgent(task('clean'));
+  const n = cardOf(hub, id).index;
+  (hub as any).changes = async () => [{ path: 'Source/Lantern.cpp' }];
+  assert.match(await act.archiveAgents({ agents: [n] }), /not archived.*Source\/Lantern\.cpp/);
+  assert.equal(cardOf(hub, id).archived, undefined);
+  assert.match(await act.archiveAgents({ agents: [n], discard_unmerged: true }), /archived/);
+  assert.equal((hub as any).agents.get(id).card.archived, true);
+  assert.match(await act.stopAgents({ agents: [n] }), /There's no agent/, 'and it is gone from the numbers');
+});
+
+test('the master chat approves only what is waiting, and reports where it got to', async () => {
+  const hub = makeHub();
+  const act = (hub as any).masterActions();
+  const busy = await hub.createAgent(task('long'));
+  assert.match(await act.approveAgents({ agents: [cardOf(hub, busy).index] }), /nothing to approve/);
+  const id = await hub.createAgent(task('testing'));
+  const n = cardOf(hub, id).index;
+  await until(() => cardOf(hub, id).status === 'finished', 'it to finish');
+  assert.equal(cardOf(hub, id).stage, 'testing');
+  const details = JSON.parse(await act.agentDetails({ agent: n }));
+  assert.equal(details.finalReport.needsTesting.length, 2);
+  assert.ok(details.recent.some((m: { text: string }) => m.text.includes('Do testing')));
+  assert.match(await act.approveAgents({ agents: [n] }), /approved, now at complete/);
+  assert.equal(cardOf(hub, id).stage, 'complete');
+  await hub.stopAgent(busy);
+});
+
+test("a one-off model from the master doesn't become the default for later tasks", async () => {
+  const hub = makeHub();
+  const act = (hub as any).masterActions();
+  const before = hub.snapshot().defaults.model;
+  await act.startTask({ prompt: 'Fix the lantern', model: 'claude-haiku-5-5', effort: 'low', permission_mode: 'default' });
+  const card = hub.snapshot().cards.at(-1)!;
+  assert.equal(card.model, 'claude-haiku-5-5');
+  assert.equal(card.permissionMode, 'default');
+  assert.equal(hub.snapshot().defaults.model, before);
+});
+
+test('an agent that hits the usage limit carries on with API credits, and goes back when told', async () => {
+  const hub = makeHub();
+  hub.setApiKey('sk-test-never-saved');
+  hub.setApiCreditsEnabled(true);
+  const id = await hub.createAgent(task('long'));
+  const r = (hub as any).agents.get(id);
+  await until(() => (hub as any).local.agents.get(id)?.runner, 'the agent to start');
+  const calls: any[] = [];
+  const realCall = (hub as any).nodeCall.bind(hub);
+  (hub as any).nodeCall = (node: string, method: string, p: any) => { if (method === 'agent.useCredits') calls.push(p); return realCall(node, method, p); };
+
+  (hub as any).reduce(r, { k: 'usage-limit', resetsAt: Date.now() + 3_600_000 });
+  (hub as any).reduce(r, { k: 'turn-end', isError: true, text: "You've hit your limit" });
+  assert.equal(cardOf(hub, id).attention, null, "it isn't reported as a failure, because it's carrying on");
+  assert.equal(cardOf(hub, id).onApiCredits, true);
+  await until(() => calls.length === 1, 'the switch');
+  assert.equal(calls[0].apiKey, 'sk-test-never-saved');
+  assert.match(calls[0].carryOn, /carry on/);
+  assert.ok(hub.transcript(id).some((t) => t.kind === 'system' && t.text.includes('carrying on with API credits')));
+
+  hub.saveNow();
+  assert.ok(!fs.readFileSync((hub as any).stateFile(), 'utf8').includes('sk-test-never-saved'), 'the key is never written with the state');
+  assert.ok(!JSON.stringify(hub.snapshot()).includes('sk-test-never-saved'), 'and never reaches the screens');
+  assert.equal(hub.snapshot().apiCredits?.enabled, true);
+  assert.equal(hub.snapshot().apiCredits?.hasKey, true);
+
+  (hub as any).endCredits();
+  assert.equal(cardOf(hub, id).onApiCredits, true, 'not before the limit resets');
+  hub.setApiCreditsEnabled(false);
+  (hub as any).endCredits();
+  assert.equal(cardOf(hub, id).onApiCredits, true, 'and not in the middle of a turn');
+  await hub.stopAgent(id);
+  (hub as any).endCredits();
+  assert.equal(cardOf(hub, id).onApiCredits, false);
+  assert.equal(calls[1].apiKey, null);
+});
+
+test('with API credits off, or no key, the limit stops the agent and says so', async () => {
+  const hub = makeHub();
+  const id = await hub.createAgent(task('long'));
+  const r = (hub as any).agents.get(id);
+  (hub as any).reduce(r, { k: 'usage-limit' });
+  (hub as any).reduce(r, { k: 'turn-end', isError: true, text: "You've hit your limit" });
+  assert.equal(cardOf(hub, id).onApiCredits, undefined);
+  assert.match(cardOf(hub, id).attention?.text ?? '', /hit your limit/);
+  hub.setApiCreditsEnabled(true);
+  assert.equal((hub as any).canUseCredits(), false, 'a key is needed too');
+  await hub.stopAgent(id);
+});
+
+test('when the credits run out, the fleet stops trying rather than failing one agent at a time', async () => {
+  const hub = makeHub();
+  hub.setApiKey('sk-test');
+  hub.setApiCreditsEnabled(true);
+  const id = await hub.createAgent(task('long'));
+  const r = (hub as any).agents.get(id);
+  await until(() => (hub as any).local.agents.get(id)?.runner, 'the agent to start');
+  r.card.onApiCredits = true;
+  (hub as any).reduce(r, { k: 'credits-failed', why: 'Your credit balance is too low' });
+  (hub as any).reduce(r, { k: 'turn-end', isError: true, text: 'Your credit balance is too low' });
+  assert.equal(cardOf(hub, id).onApiCredits, false);
+  assert.match(cardOf(hub, id).attention?.text ?? '', /credit balance/, 'the user is told');
+  assert.match(hub.snapshot().apiCredits?.problem ?? '', /credit balance/);
+  assert.equal((hub as any).canUseCredits(), false);
+  hub.setApiCreditsEnabled(true);
+  assert.equal((hub as any).canUseCredits(), true, 'turning it on again tries again');
+  await hub.stopAgent(id);
+});
+
+function hubWithProject() {
+  const hub = makeHub();
+  const dir = tmp('fleet-workspace-');
+  const file = path.join(dir, 'Game.uproject');
+  fs.writeFileSync(file, '{"EngineAssociation":"5.8"}');
+  (hub as any).local.info.projects.unshift(readProject(file, []));
+  return { hub, file, act: (hub as any).masterActions(), rec: (id: string) => (hub as any).agents.get(id) };
+}
+
+test('the workspace chat runs on this PC in the real project, and a project only ever has one', async () => {
+  const { hub, act } = hubWithProject();
+  assert.match(await act.openWorkspaceChat({ prompt: 'Merge main into this branch' }), /as the workspace chat for Game/);
+  const card = hub.snapshot().cards.find((c) => c.isWorkspace)!;
+  assert.equal(card.nodeId, 'master');
+  assert.equal(card.permissionMode, 'auto');
+  assert.equal(card.stage, undefined, "it's a chat, so it has no stages");
+  assert.equal(card.title, 'Workspace: Game');
+  assert.match(await act.openWorkspaceChat({ prompt: 'Now update' }), /already the workspace chat/);
+  assert.equal(hub.snapshot().cards.filter((c) => c.isWorkspace).length, 1);
+  await until(() => hub.transcript(card.id).some((t) => t.kind === 'user' && t.text === 'Now update'), 'the request to reach it');
+});
+
+test('holding the workspace pauses agents in it, holds back new ones, and tells them afterwards', async () => {
+  const { hub, file, act, rec } = hubWithProject();
+  await act.openWorkspaceChat({ prompt: 'Merge main' });
+  const chat = hub.snapshot().cards.find((c) => c.isWorkspace)!.id;
+  const inFolder = await hub.createAgent(task('long', { projectFile: file }));
+  const elsewhere = await hub.createAgent(task('long'));
+  await until(() => cardOf(hub, inFolder).status !== 'queued' && (hub as any).local.agents.get(inFolder)?.runner, 'it to start');
+
+  const held = JSON.parse(await (hub as any).holdWorkspace(rec(chat)));
+  assert.deepEqual(held.agents.map((a: { agent: number; paused: boolean }) => [a.agent, a.paused]), [[cardOf(hub, inFolder).index, true]], 'only the agent in that folder');
+  assert.equal(typeof held.personEditorOpen, 'boolean');
+  assert.equal(cardOf(hub, inFolder).pausedForWorkspace, true);
+  assert.equal(cardOf(hub, chat).holdingWorkspace, true);
+  assert.notEqual(cardOf(hub, elsewhere).pausedForWorkspace, true);
+  await until(() => cardOf(hub, inFolder).status === 'idle', 'it to stop');
+
+  const late = await hub.createAgent(task('clean', { projectFile: file }));
+  assert.equal(rec(late).heldNew, true, 'a new task waits');
+  assert.equal((hub as any).local.agents.has(late), false);
+  let merged = false;
+  const merging = (hub as any).merge(rec(inFolder)).then(() => { merged = true; });
+  await sleep(150);
+  assert.equal(merged, false, 'and so does work coming back to the workspace');
+
+  assert.match(await hub.releaseWorkspace(chat, 'merged main into dev'), /2 agents/);
+  await merging;
+  assert.equal(cardOf(hub, chat).holdingWorkspace, false);
+  assert.equal(cardOf(hub, inFolder).pausedForWorkspace, false);
+  await until(() => hub.transcript(inFolder).some((t) => t.kind === 'user' && t.text.includes('merged main into dev')), 'the agent to be told what changed');
+  await until(() => (hub as any).local.agents.has(late), 'the new task to start');
+  for (const id of [inFolder, elsewhere, late]) await hub.stopAgent(id);
+});
+
+test('archiving the workspace chat lets the agents go, and all-done ignores it', async () => {
+  const { hub, file, act, rec } = hubWithProject();
+  await act.openWorkspaceChat({ prompt: 'Merge main' });
+  const chat = hub.snapshot().cards.find((c) => c.isWorkspace)!.id;
+  await (hub as any).holdWorkspace(rec(chat));
+  const late = await hub.createAgent(task('clean', { projectFile: file }));
+  assert.equal(rec(late).heldNew, true);
+  await hub.archive(chat);
+  await until(() => (hub as any).local.agents.has(late), 'the held task to start');
+  assert.equal((hub as any).workspaceHolds.size, 0);
+  await hub.stopAgent(late);
+});
+
+// An agent on another machine, in that machine's own workspace, coming back to this one.
+async function mergeFromLaptop(base: Record<string, string | null>) {
+  const hub = makeHub();
+  const here = tmp('fleet-here-');
+  const there = tmp('fleet-there-');
+  const id = await hub.createAgent(task('clean'));
+  await hub.stopAgent(id);
+  const r = (hub as any).agents.get(id);
+  r.card.nodeId = 'laptop';
+  r.card.slot = { shared: true };
+  r.card.createdAt = 0;
+  r.sourceProjectDir = here;
+  const put = (root: string, rel: string, text: string) => {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), text);
+  };
+  (hub as any).nodeCall = async (_node: string, method: string, p: any) => {
+    if (method === 'agent.changes') return fs.readdirSync(there, { recursive: true, withFileTypes: true }).filter((e) => e.isFile()).map((e) => ({ path: path.relative(there, path.join(e.parentPath, e.name)), kind: 'modified' }));
+    if (method === 'agent.readFile') return readChunk(path.join(there, p.path), p.offset);
+    if (method === 'agent.baseText') return base[p.path] == null ? null : Buffer.from(base[p.path]!).toString('base64');
+    return null;
+  };
+  return { hub, id, here: (rel: string, text: string) => put(here, rel, text), there: (rel: string, text: string) => put(there, rel, text), read: (rel: string) => fs.readFileSync(path.join(here, rel), 'utf8'), r };
+}
+const ORIGINAL = 'one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\r\n';
+
+test('edits to different parts of a file both land, like a version control merge', async () => {
+  const m = await mergeFromLaptop({ 'A.cpp': ORIGINAL });
+  m.here('A.cpp', ORIGINAL.replace('one', 'one edited here'));
+  m.there('A.cpp', ORIGINAL.replace('eight', 'eight edited by the agent'));
+  const res = await m.hub.apply(m.id);
+  assert.deepEqual(res.conflicts, []);
+  assert.deepEqual(res.merged, ['A.cpp']);
+  assert.equal(m.read('A.cpp'), ORIGINAL.replace('one', 'one edited here').replace('eight', 'eight edited by the agent'), 'both, with the line endings kept');
+
+  m.here('A.cpp', ORIGINAL.replace('one', 'one edited again').replace('eight', 'eight edited by the agent'));
+  const again = await m.hub.apply(m.id);
+  assert.deepEqual(again.merged, [], 'with nothing new from the agent there is nothing to merge');
+  assert.equal(m.read('A.cpp'), ORIGINAL.replace('one', 'one edited again').replace('eight', 'eight edited by the agent'));
+});
+
+test('an agent resumed on another machine is told the engine version, which is how that machine finds its engine', async () => {
+  const { hub, file, rec } = hubWithProject();
+  const id = await hub.createAgent(task('clean', { projectFile: file }));
+  await hub.stopAgent(id);
+  const r = rec(id);
+  r.card.nodeId = 'laptop';
+  r.sourceProjectDir = path.dirname(file);
+  const spawned: any[] = [];
+  (hub as any).nodeCall = async (_node: string, method: string, p: any) => {
+    if (method === 'agent.spawn') spawned.push(p);
+    return method === 'agent.has' ? false : null;
+  };
+  await (hub as any).ensureRunning(r);
+  assert.equal(spawned[0].engineVersion, readProject(file, [])?.engineVersion);
+  assert.ok(spawned[0].engineVersion);
+});
+
+test('merges of the same card that overlap take turns', async () => {
+  const m = await mergeFromLaptop({ 'A.cpp': ORIGINAL });
+  m.here('A.cpp', ORIGINAL.replace('one', 'one edited here'));
+  m.there('A.cpp', ORIGINAL.replace('eight', 'eight edited by the agent'));
+  const all = await Promise.all([m.hub.apply(m.id), m.hub.apply(m.id), m.hub.apply(m.id)]);
+  assert.deepEqual(all.flatMap((r) => r.conflicts), []);
+  assert.equal(m.read('A.cpp'), ORIGINAL.replace('one', 'one edited here').replace('eight', 'eight edited by the agent'));
+});
+
+test('edits to the same lines stop for a decision and leave the file alone', async () => {
+  const m = await mergeFromLaptop({ 'A.cpp': ORIGINAL });
+  const mine = ORIGINAL.replace('four', 'four edited here');
+  m.here('A.cpp', mine);
+  m.there('A.cpp', ORIGINAL.replace('four', 'four edited by the agent'));
+  const res = await m.hub.apply(m.id);
+  assert.match(res.conflicts[0].reason, /same lines/);
+  assert.equal(m.read('A.cpp'), mine);
+  await m.hub.apply(m.id, undefined, ['A.cpp']);
+  assert.equal(m.read('A.cpp'), ORIGINAL.replace('four', 'four edited by the agent'), "choosing the agent's changes takes them");
+});
+
+test("choosing the agent's changes settles the disputed lines, and can't undo newer code elsewhere in the file", async () => {
+  const m = await mergeFromLaptop({ 'A.cpp': ORIGINAL });
+  // The agent's machine is on an older changeset, so its whole file doesn't have what was checked in since.
+  const newerCheckIn = `${ORIGINAL}seven hundred more lines\r\n`;
+  m.here('A.cpp', newerCheckIn.replace('one', 'one added here'));
+  m.there('A.cpp', ORIGINAL.replace('one', 'one added by the agent'));
+  const res = await m.hub.apply(m.id);
+  assert.match(res.conflicts[0].reason, /same lines/);
+  await m.hub.apply(m.id, undefined, ['A.cpp']);
+  assert.equal(m.read('A.cpp'), newerCheckIn.replace('one', 'one added by the agent'));
+});
+
+test("a check-in here that the agent's machine hasn't got isn't undone by the merge", async () => {
+  const m = await mergeFromLaptop({ 'A.cpp': ORIGINAL });
+  m.r.card.createdAt = Date.now() + 60_000; // nothing has changed here since the task started
+  m.here('A.cpp', ORIGINAL.replace('one', 'one from a newer check-in'));
+  m.there('A.cpp', ORIGINAL.replace('eight', 'eight edited by the agent'));
+  await m.hub.apply(m.id);
+  assert.equal(m.read('A.cpp'), ORIGINAL.replace('one', 'one from a newer check-in').replace('eight', 'eight edited by the agent'));
+});
+
+test('work sent back and merged again is measured against the last merge, not the original', async () => {
+  const m = await mergeFromLaptop({ 'A.cpp': ORIGINAL });
+  m.here('A.cpp', ORIGINAL.replace('one', 'one edited here'));
+  m.there('A.cpp', ORIGINAL.replace('eight', 'eight, first try'));
+  await m.hub.apply(m.id);
+  m.there('A.cpp', ORIGINAL.replace('eight', 'eight, second try'));
+  const res = await m.hub.apply(m.id);
+  assert.deepEqual(res.conflicts, [], 'its own earlier work is no conflict');
+  assert.equal(m.read('A.cpp'), ORIGINAL.replace('one', 'one edited here').replace('eight', 'eight, second try'));
+});
+
+test('with nothing to merge from it stops and says why, and the same contents are no conflict', async () => {
+  const m = await mergeFromLaptop({ 'New.cpp': null, 'Same.cpp': null });
+  m.here('New.cpp', 'mine\n');
+  m.there('New.cpp', 'theirs\n');
+  m.here('Same.cpp', 'identical\n');
+  m.there('Same.cpp', 'identical\n');
+  const res = await m.hub.apply(m.id);
+  assert.deepEqual(res.conflicts.map((c) => c.path), ['New.cpp']);
+  assert.match(res.conflicts[0].reason, /no earlier version to merge from/);
+  assert.equal(m.read('New.cpp'), 'mine\n');
+  assert.deepEqual(res.applied, ['Same.cpp']);
+});
+
+test('a binary changed on both sides stops for a decision', async () => {
+  const m = await mergeFromLaptop({ 'Map.uasset': 'original' });
+  m.here('Map.uasset', 'mine');
+  m.there('Map.uasset', 'theirs');
+  const res = await m.hub.apply(m.id);
+  assert.match(res.conflicts[0].reason, /binary/);
+  assert.equal(m.read('Map.uasset'), 'mine');
+});
+
+test('a binary still as the agent found it can simply be replaced', async () => {
+  const m = await mergeFromLaptop({});
+  m.here('Map.uasset', 'original');
+  m.there('Map.uasset', 'theirs');
+  const realCall = (m.hub as any).nodeCall;
+  (m.hub as any).nodeCall = async (node: string, method: string, p: any) => (method === 'agent.baseHash' ? crypto.createHash('sha256').update('original').digest('hex') : realCall(node, method, p));
+  const res = await m.hub.apply(m.id);
+  assert.deepEqual(res.applied, ['Map.uasset']);
+  assert.equal(m.read('Map.uasset'), 'theirs');
+});
+
+test("a machine on an older changeset can't overwrite newer code, even with nothing changed here lately", async () => {
+  const m = await mergeFromLaptop({ 'Widgets.cpp': null });
+  m.r.card.createdAt = Date.now() + 60_000; // nothing has changed here since the task started
+  m.here('Widgets.cpp', 'seven hundred lines from a newer check-in\n');
+  m.there('Widgets.cpp', 'the older version, plus a small fix\n');
+  const res = await m.hub.apply(m.id);
+  assert.match(res.conflicts[0].reason, /no earlier version to merge from/);
+  assert.deepEqual(res.applied, []);
+  assert.equal(m.read('Widgets.cpp'), 'seven hundred lines from a newer check-in\n');
+});
+
+test("a file the agent deleted isn't removed if it also changed here", async () => {
+  const m = await mergeFromLaptop({});
+  m.here('A.cpp', 'still needed\n');
+  (m.hub as any).changes = async () => [{ path: 'A.cpp', kind: 'deleted' }];
+  const res = await m.hub.apply(m.id);
+  assert.match(res.conflicts[0].reason, /deleted/);
+  assert.equal(m.read('A.cpp'), 'still needed\n');
+});
+
+test('the version to merge from comes from the changeset the workspace is on', async () => {
+  const dir = tmp('fleet-plastic-');
+  fs.mkdirSync(path.join(dir, '.plastic'));
+  const asked: string[][] = [];
+  const cm: CmRun = async (args) => {
+    asked.push(args);
+    if (args[0] === 'status') return 'STATUS|6228|Night Crew|ssl://server:8088\n';
+    if (args[1] === 'Source/New.cpp#cs:6228') throw new Error('The specified revision was not found');
+    fs.writeFileSync(args[2].replace('--file=', ''), 'line\r\n');
+    return '';
+  };
+  assert.equal((await checkedInVersion(dir, 'Source\\A.cpp', cm))?.toString(), 'line\r\n');
+  assert.equal(asked[1][1], 'Source/A.cpp#cs:6228');
+  assert.equal(await checkedInVersion(dir, 'Source\\New.cpp', cm), null, 'a file with no history has none');
+
+  const repo = tmp('fleet-git-');
+  const git = (...a: string[]) => execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { stdio: 'ignore' });
+  git('init', '-q');
+  git('config', 'core.autocrlf', 'false');
+  fs.mkdirSync(path.join(repo, 'Source'));
+  fs.writeFileSync(path.join(repo, 'Source/A.cpp'), 'committed\n');
+  git('add', '-A');
+  git('commit', '-qm', 'first');
+  fs.writeFileSync(path.join(repo, 'Source/A.cpp'), 'pending\n');
+  assert.equal((await checkedInVersion(repo, 'Source\\A.cpp'))?.toString(), 'committed\n');
+  assert.equal(await checkedInVersion(repo, 'Source\\New.cpp'), null);
+  assert.equal(await checkedInVersion(tmp('fleet-none-'), 'A.cpp'), null, 'no source control, no version');
+});
+
+test("the master chat's permissions change from its chat or by asking, stay through a restart, and can't be bypass", async () => {
+  const dataDir = tmp('fleet-flow-');
+  const hub = new Hub({ dataDir, version: 'test', demo: true, hostAppPath: null });
+  const act = (hub as any).masterActions();
+  assert.equal(cardOf(hub, MASTER_CHAT_ID).permissionMode, 'default');
+  await hub.setMasterPermissions('auto');
+  assert.equal(cardOf(hub, MASTER_CHAT_ID).permissionMode, 'auto');
+  assert.equal((hub as any).agents.get(MASTER_CHAT_ID).spawn.permissionMode, 'auto', 'so its next session starts on it');
+  await assert.rejects(() => hub.setMasterPermissions('bypassPermissions'), /can't use/);
+  assert.equal(cardOf(hub, MASTER_CHAT_ID).permissionMode, 'auto');
+  assert.match(await act.setOwnPermissions({ mode: 'default' }), /now uses default/);
+  await until(() => cardOf(hub, MASTER_CHAT_ID).permissionMode === 'default', 'asking it to change');
+  await hub.setMasterPermissions('auto');
+  await hub.shutdown();
+  const again = new Hub({ dataDir, version: 'test', demo: true, hostAppPath: null });
+  hubs.push(again);
+  assert.equal(cardOf(again, MASTER_CHAT_ID).permissionMode, 'auto');
+  assert.equal((again as any).agents.get(MASTER_CHAT_ID).spawn.permissionMode, 'auto');
 });
 
 test('the master chat survives a restart with its conversation, and raises no popup for a reply', async () => {
@@ -280,7 +726,7 @@ test('a conflict pauses the merge until the user picks a side', async () => {
   await hub.approve(id);
   assert.equal(cardOf(hub, id).stage, 'awaiting-merge');
   assert.deepEqual(cardOf(hub, id).merge?.conflicts, conflict);
-  assert.match(cardOf(hub, id).attention!.text, /1 file also changed/);
+  assert.match(cardOf(hub, id).attention!.text, /1 file couldn't be merged/);
 
   await hub.resolveConflicts(id, 'agent');
   assert.deepEqual(forced, ['Source/A.cpp']);

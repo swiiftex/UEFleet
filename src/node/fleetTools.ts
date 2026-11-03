@@ -12,7 +12,7 @@ const text = (t: string, isError = false) => ({ content: [{ type: 'text' as cons
 
 export const FLEET_TOOLS = [
   'ue_status', 'ue_list_toolsets', 'ue_describe_toolset', 'ue_call', 'ue_build', 'ue_run_tests',
-  'ue_launch_game', 'ue_stop_games', 'ue_log', 'ue_crash', 'ue_stop', 'report_progress', 'ask_master', 'finish_task',
+  'ue_launch_game', 'ue_stop_games', 'ue_log', 'ue_crash', 'ue_stop', 'report_progress', 'ask_master', 'finish_task', 'hold_workspace', 'release_workspace',
 ].map((n) => `mcp__fleet__${n}`);
 
 const SHARED_FOLDER = (slot: Slot) => `You're working directly in the user's project at ${slot.dir}. Other agents on this machine work in the same files, and the user may be too. Whatever you save is in their workspace straight away, with nothing to apply afterwards. Your own editor keeps its logs, settings and saves in ${slot.own}, so you never queue for Play In Editor.`;
@@ -31,31 +31,56 @@ Because these files are shared:
 - If a build says Live Coding is active, the user has the project open in their own editor. Tell them, and wait for them to close it or turn Live Coding off.
 `;
 
-export function appendPrompt(slot: Slot | null, projectNotes?: string) {
+const WORKSPACE_RULES = `
+These files are shared with the user and with other agents, but unlike those agents you're here to change the workspace itself.
+`;
+
+const ASKING_THE_MASTER = `# Asking the master
+This machine may not be logged into Jira, Codevelop or the other services the user works with, and your tools here can't reach them. The master chat, on the user's main PC, can. When you need a ticket, a design note or anything else from those, call ask_master with a specific question instead of guessing. It waits for the answer, which may take a while if the master has to ask the user. Use AskUserQuestion for decisions only the user can make.`;
+
+const WORKSPACE_CHAT = `# You are the workspace chat
+The user opened you to change the workspace as a whole, such as merging branches, switching or updating, or settling a merge. Other agents are forbidden from doing this, and you're allowed to. You're a chat rather than a task, so there's no progress bar or finish_task. End your turn when you've done what was asked or you need the user.
+
+Before changing anything:
+1. Look at where things stand with the project's own tool, such as cm status, git status or p4 opened: the branch, the pending changes, and what the request would touch.
+2. Call hold_workspace before anything that changes many files, such as a merge, switch, update or revert. It pauses the other agents on this project on this PC, stops their editors, waits for any build to finish, and lists each agent's changed files.
+3. Treat every pending change as someone else's work until shown otherwise. If what you're about to do could touch, mix in or discard any of it, list what's affected and ask with AskUserQuestion first.
+4. If hold_workspace says a person has an editor open on the project, ask them to close it first. It keeps its old assets in memory and could save them over what you've merged.
+
+While you do it:
+- Ask about any conflict you can't settle with certainty. Don't pick a side to get it finished.
+- Never check in, commit, push or delete a branch unless the user asked for that step in their own words, and then name only the files that belong to it.
+- Ask first before anything that can't be undone, such as discarding changes or forcing anything.
+
+Afterwards:
+- If code changed, run ue_build, and say if it fails.
+- Call release_workspace with one line on what changed, so the agents carry on knowing about it. Stay on hold while you're waiting for the user in the middle of a merge, and tell them the agents are paused.`;
+
+export function appendPrompt(slot: Slot | null, projectNotes?: string, workspace?: boolean) {
   const instance = slot ? `
 # Your Unreal instance
 ${slot.shared ? SHARED_FOLDER(slot) : PRIVATE_COPY(slot)}
 
 Use the mcp__fleet tools for all Unreal work:
 - ue_list_toolsets, ue_describe_toolset and ue_call drive your editor (Play In Editor, logs, screenshots, assets, automation). The editor boots on first use and restarts itself after a crash or a build.
-- ${slot.shared ? SHARED_BUILD : COPY_BUILD} If it fails because it would modify engine files, the engine itself needs a rebuild that only the user can do. Don't work around that: say so in your final message.
+- ${slot.shared ? `${SHARED_BUILD} If the engine itself is out of date, the build rebuilds it too, which takes longer.` : `${COPY_BUILD} If it fails because it would modify engine files, the engine itself needs a rebuild that only the user can do. Don't work around that: say so in your final message.`}
 - ue_run_tests runs automation tests in a separate process. Pass render true for tests that need a GPU, such as visual or flow tests. ue_launch_game starts real standalone game processes, including a listen server with clients for networking checks.
 - ue_log reads your editor log and ue_crash reports the newest crash with its callstack.
 
 Don't start UnrealEditor, Build.bat or UnrealBuildTool yourself. ${slot.shared ? 'Your own Saved/SaveGames' : "There is a git repository over this copy's text files, so git diff shows your code changes. Saved/SaveGames"} starts as a copy of the user's saves, and nothing you do to it reaches the real ones.
-${slot.shared ? SHARED_RULES : ''}
+${workspace ? WORKSPACE_RULES : slot.shared ? SHARED_RULES : ''}
 The project's CLAUDE.md and memory notes were mostly written for someone working in the real project with one shared editor. They still apply for code, gameplay and test knowledge, but these rules win wherever they disagree:
 - Anything that reaches an editor on a fixed port or through remote Python execution, such as a helper script or a port number in the notes, reaches the user's own editor and could cost them work. Use only the ue_ tools, which always reach yours.
 - ${slot.shared ? "Your editor is yours alone, and a build doesn't disturb anyone else's. Rebuild and restart whenever you need to, without asking, and don't coordinate with other sessions about it." : "This copy and this editor are yours alone. Rebuild and restart them whenever you need to, without asking, and don't coordinate with other sessions about them."}
 - Notes you save go into the real project's memory, so only write what's true for the real project${slot.shared ? ', not details of your own instance' : ', not details of this copy'}.
 ` : '';
   const notes = projectNotes ? `\n# Notes for this project\n${projectNotes}\n` : '';
+  if (workspace) return `${instance}${notes}\n${ASKING_THE_MASTER}\n\n${WORKSPACE_CHAT}`;
   return `${instance}${notes}
 # Progress
 Your card shows a progress bar. Call report_progress with a rough percentage of the whole task as soon as you have a sense of its size, then again at each real step forward, such as finding the cause, getting a build through or passing a test. Don't call it after every small action. A rough guess is fine, and it can go down if the job turns out bigger. You don't need to reach 100, because finish_task fills the bar. If the user gives you more to do after you've finished, the bar starts again, so report on the new work.
 
-# Asking the master
-This machine may not be logged into Jira, Codevelop or the other services the user works with, and your tools here can't reach them. The master chat, on the user's main PC, can. When you need a ticket, a design note or anything else from those, call ask_master with a specific question instead of guessing. It waits for the answer, which may take a while if the master has to ask the user. Use AskUserQuestion for decisions only the user can make.
+${ASKING_THE_MASTER}
 
 # Finishing
 When the task is done, call finish_task. Until you call it the user sees you as waiting on them, so end a turn without it only when you need something from them.
@@ -91,7 +116,7 @@ export function liftImages(result: any) {
   return { ...result, content };
 }
 
-export function fleetServer(slot: Slot | null, onFinish: (r: FinalReport) => void, onProgress: (percent: number) => void, askMaster: (question: string) => Promise<string>) {
+export function fleetServer(slot: Slot | null, onFinish: (r: FinalReport) => void, onProgress: (percent: number) => void, askMaster: (question: string) => Promise<string>, holdWorkspace?: (on: boolean, summary?: string) => Promise<string>) {
   const needSlot = () => {
     if (!slot) throw new Error('This task has no Unreal project attached.');
     return slot;
@@ -157,27 +182,34 @@ export function fleetServer(slot: Slot | null, onFinish: (r: FinalReport) => voi
       }, guarded(async (a) => text(await needSlot().tail(a.lines ?? 80, a.grep)))),
       always('ue_crash', 'Newest crash in your instance: error message, callstack and log errors.', {}, guarded(async () => text(await needSlot().crashInfo()))),
       always('ue_stop', 'Stop your editor to free its place for other agents. It boots again when needed.', {}, guarded(async () => { await needSlot().stopEditor(); return text('Stopped.'); })),
-      always('report_progress', 'Say roughly how far through the whole task you are. It shows as a progress bar on your card.', {
-        percent: z.number().min(0).max(100).describe('Rough percentage of the whole task done so far.'),
-      }, guarded(async (a) => { onProgress(a.percent); return text('Recorded.'); })),
+      ...(holdWorkspace ? [
+        always('hold_workspace', "Pause the other agents on this project on this PC, stop their editors and wait for any build, before changing the workspace. Returns each agent's changed files, and whether a person has an editor open.", {}, guarded(async () => text(await holdWorkspace(true)))),
+        always('release_workspace', 'Let the paused agents carry on, telling them what changed.', {
+          summary: z.string().describe('One line on what changed in the workspace.'),
+        }, guarded(async (a) => text(await holdWorkspace(false, a.summary)))),
+      ] : [
+        always('report_progress', 'Say roughly how far through the whole task you are. It shows as a progress bar on your card.', {
+          percent: z.number().min(0).max(100).describe('Rough percentage of the whole task done so far.'),
+        }, guarded(async (a) => { onProgress(a.percent); return text('Recorded.'); })),
+        always('finish_task', 'Report that the task is done. The user sees this as your final message.', {
+          summary: z.string().describe('One or two sentences on what changed.'),
+          files_changed: z.array(z.string()).optional().describe("Every file you changed, created or deleted in the project, including through scripts or your editor. Other agents' changes don't belong here."),
+          verified: z.array(z.string()).describe('What you checked yourself, and how.'),
+          needs_human_testing: z.array(z.object({
+            what: z.string().describe('A few words naming the check, shown as a checklist item.'),
+            how: z.string().describe('Exact steps for someone who has not followed this task: which map or menu, what to do, in what order.'),
+            expect: z.string().describe('What they should see if it works, so they know when to tick it.'),
+            why: z.string().optional().describe('Why you could not check it yourself.'),
+          })).describe('Only what you could not check instantly and reliably yourself. Empty when your own checks prove it works.'),
+        }, guarded(async (a) => {
+          for (const f of a.files_changed ?? []) slot?.noteChanged(f, 'reported');
+          onFinish({ summary: a.summary, verified: a.verified, needsTesting: a.needs_human_testing as HumanTest[], at: Date.now() });
+          return text('Recorded. Stop here unless the user replies.');
+        })),
+      ]),
       always('ask_master', "Ask the master chat for something this machine can't reach, such as a Jira ticket or a Codevelop note. Waits for the answer.", {
         question: z.string().describe('What you need, specifically enough to answer without further context. Name any ticket or document.'),
       }, guarded(async (a) => text(await askMaster(a.question)))),
-      always('finish_task', 'Report that the task is done. The user sees this as your final message.', {
-        summary: z.string().describe('One or two sentences on what changed.'),
-        files_changed: z.array(z.string()).optional().describe("Every file you changed, created or deleted in the project, including through scripts or your editor. Other agents' changes don't belong here."),
-        verified: z.array(z.string()).describe('What you checked yourself, and how.'),
-        needs_human_testing: z.array(z.object({
-          what: z.string().describe('A few words naming the check, shown as a checklist item.'),
-          how: z.string().describe('Exact steps for someone who has not followed this task: which map or menu, what to do, in what order.'),
-          expect: z.string().describe('What they should see if it works, so they know when to tick it.'),
-          why: z.string().optional().describe('Why you could not check it yourself.'),
-        })).describe('Only what you could not check instantly and reliably yourself. Empty when your own checks prove it works.'),
-      }, guarded(async (a) => {
-        for (const f of a.files_changed ?? []) slot?.noteChanged(f, 'reported');
-        onFinish({ summary: a.summary, verified: a.verified, needsTesting: a.needs_human_testing as HumanTest[], at: Date.now() });
-        return text('Recorded. Stop here unless the user replies.');
-      })),
     ],
   });
 }

@@ -11,10 +11,11 @@ import { NodeService } from '../node/nodeService';
 import { assignToChangelist, isPlasticWorkspace, realCm, type CmRun } from '../node/plastic';
 import { buildManifest, CHUNK, isBinaryPath, readChunk, writeChunk, mergeText } from '../node/projectSync';
 import { describeMachine, readProject } from '../node/machine';
-import { BUCKETS, MASTER_CHAT_ID, type ActivityBucket, type AgentCard, type AgentEvent, type AgentSpawn, type AgentStatus, type AppUpdate, type ApplyResult, type Broadcast, type ChangedFile, type FleetSnapshot, type FlowStage, type HubEvent, type ImageAttachment, type MachineView, type NewTask, type NewTaskDefaults, type NodeEvent, type NodeInfo, type ProjectInfo, type SlotInfo, type TranscriptItem } from '../shared/protocol';
+import type { PendingChange, WorkspaceState } from '../node/sourceControl';
+import { BUCKETS, DEFAULT_PERMISSION_MODE, MASTER_CHAT_ID, MASTER_PERMISSION_MODES, modelLabel, type ActivityBucket, type AgentCard, type AgentEvent, type AgentOptions, type AgentSpawn, type ApiCreditsView, type AgentStatus, type AppUpdate, type ApplyResult, type Broadcast, type ChangedFile, type FleetSnapshot, type FlowStage, type HubEvent, type ImageAttachment, type MachineView, type NewTask, type NewTaskDefaults, type NodeEvent, type NodeInfo, type ProjectInfo, type SlotInfo, type TranscriptItem } from '../shared/protocol';
 import { HostUpdates } from './hostUpdates';
 import { LinkServer, LOCAL_HOST_ID, type RemoteNode } from './link';
-import { DemoMaster, MASTER_EFFORT, MASTER_MODEL, RealMaster, type MasterActions, type MasterBackend } from './masterChat';
+import { chosenOptions, DemoMaster, MASTER_EFFORT, MASTER_MODEL, RealMaster, type MasterActions, type MasterBackend } from './masterChat';
 import { placeTask } from './placement';
 
 const emptyBuckets = () => Object.fromEntries(BUCKETS.map((b) => [b, 0])) as Record<ActivityBucket, number>;
@@ -43,6 +44,9 @@ interface AgentRec {
   notStarted?: boolean; // its project never reached its machine, so the next message tries again
   stopSending?: boolean;
   sendQuestion?: { id: string; answer: (send: boolean) => void };
+  applying?: Promise<unknown>; // the merge from its machine that's in progress
+  switchingCredits?: boolean; // its failed turn is ending, and it's about to carry on
+  heldNew?: boolean; // hasn't started, because a workspace chat has the project on hold
   applied?: Map<string, number>; // the date each file had when it was last applied here
   pulled?: string[]; // its files that are in the user's workspace
   keepMine?: string[]; // files the user chose to keep their own version of
@@ -66,6 +70,12 @@ const LOCAL_HOST_WAIT_MS = 30_000;
 // Sending more than this across a network is worth a question first.
 const ASK_BEFORE_SENDING_BYTES = 2 ** 30;
 const SEND_IT = 'Send it';
+const CREDITS_RETRY_MS = 30 * 60_000;
+const WORKSPACE_FRESH_MS = 30 * 60_000; // how long a machine's workspace counts as recent before a new task
+const SYNC_WAIT_MS = 60_000;
+
+type SyncResult = { outcome: 'updated' | 'current' | 'blocked' | 'failed'; message: string };
+const NO_MERGE_BASE = "there's no earlier version to merge from";
 const sizeText = (bytes: number) => (bytes >= 2 ** 30 ? `${(bytes / 2 ** 30).toFixed(1)} GB` : `${Math.round(bytes / 2 ** 20)} MB`);
 
 class SendStopped extends Error {}
@@ -83,7 +93,7 @@ export class Hub extends EventEmitter {
   private dirtyCards = new Set<string>();
   private broadcasts: Broadcast[] = [];
   private doneTests = new Set<string>();
-  private defaults: NewTaskDefaults = { model: 'claude-opus-5-5', effort: 'xhigh', permissionMode: 'acceptEdits', instanceMode: 'offscreen', projectFile: null };
+  private defaults: NewTaskDefaults = { model: 'claude-opus-5-5', effort: 'xhigh', permissionMode: DEFAULT_PERMISSION_MODE, instanceMode: 'offscreen', projectFile: null };
   private nextIndex = 1;
   private timers: NodeJS.Timeout[] = [];
   private machinesDirty = false;
@@ -92,6 +102,14 @@ export class Hub extends EventEmitter {
   private masterRec!: AgentRec;
   private masterBackend: MasterBackend | null = null;
   private masterOptions: NewTask | null = null;
+  // The key is only ever in memory here. The app keeps it encrypted on disk.
+  private apiCredits: { enabled: boolean; key: string | null; problem?: string; failedAt?: number } = { enabled: false, key: null };
+  private workspaceHolds = new Map<string, string>(); // project file to the workspace chat holding it
+  private holdWaiters: (() => void)[] = [];
+  private workspaceSyncs = new Map<string, Promise<SyncResult>>(); // updates running now, by machine and project
+  private queuedSyncs = new Map<string, { nodeId: string; file: string; project: string }>(); // waiting for work there to finish
+  private lastSynced: Record<string, number> = {};
+  private delivered: Record<string, Record<string, string[]>> = {}; // by machine: the hash of each file that reached this PC from it
   private unrouted: NewTask[] = []; // requests the master hasn't got through yet, for if it can't
   private openQuestions = new Map<string, OpenQuestion>();
 
@@ -118,7 +136,7 @@ export class Hub extends EventEmitter {
     this.ensureMasterCard();
     this.timers.push(setInterval(() => this.flush(), 120));
     this.timers.push(setInterval(() => this.sampleSpark(), 2000));
-    this.timers.push(setInterval(() => { this.hostUpdates.checkAll(); this.watchLocalHost(); }, 5000));
+    this.timers.push(setInterval(() => { this.hostUpdates.checkAll(); this.watchLocalHost(); this.endCredits(); this.runQueuedSyncs(); }, 5000));
   }
 
   private get localNode() { return this.link.nodes.get(LOCAL_HOST_ID); }
@@ -180,7 +198,8 @@ export class Hub extends EventEmitter {
   private busyOn(nodeId: string) {
     const cards = [...this.agents.values()].map((r) => r.card).filter((c) => !c.archived && c.nodeId === nodeId);
     const testing = nodeId === LOCAL_HOST_ID ? [...this.agents.values()].filter((r) => r.card.testRun && TEST_RUN_BUSY.has(r.card.testRun.stage)).length : 0;
-    return testing + cards.filter((c) => LIVE.has(c.status) || !!c.attention?.ref).length;
+    const updating = [...this.workspaceSyncs.keys()].filter((k) => k.startsWith(`${nodeId}|`)).length;
+    return testing + updating + cards.filter((c) => LIVE.has(c.status) || !!c.attention?.ref).length;
   }
 
   restartHost(nodeId: string) { return this.hostUpdates.restartNow(nodeId); }
@@ -232,9 +251,14 @@ export class Hub extends EventEmitter {
     for (const r of this.agents.values()) {
       const c = r.card;
       if (c.archived || c.nodeId !== nodeId) continue;
-      if (c.stage === 'merged' || c.stage === 'checking-in' || (c.stage === 'awaiting-merge' && !c.merge?.conflicts?.length)) void this.advance(r);
+      const conflicts = c.merge?.conflicts ?? [];
+      // A machine that can now provide a version to merge from settles what it couldn't before.
+      const canMergeNow = !!this.nodeInfo(nodeId)?.sharedMergeBase && conflicts.some((f) => f.reason.includes(NO_MERGE_BASE) || f.reason.startsWith('Also changed on this machine'));
+      if (c.stage === 'merged' || c.stage === 'checking-in' || (c.stage === 'awaiting-merge' && (!conflicts.length || canMergeNow))) void this.advance(r);
     }
   }
+
+  private nodeInfo(nodeId: string) { return nodeId === LOCAL_HOST_ID ? this.localInfo : this.link.nodes.get(nodeId)?.info; }
 
   private lastSeqFor(hostId: string) {
     const out: Record<string, number> = {};
@@ -339,6 +363,21 @@ export class Hub extends EventEmitter {
       case 'ask-master':
         this.questionForMaster(r, ev.id, ev.question);
         break;
+      case 'usage-limit':
+        if (this.canUseCredits()) {
+          r.switchingCredits = true;
+          void this.switchToCredits(r, ev.resetsAt);
+        }
+        break;
+      case 'credits-failed':
+        this.creditsFailed(r, ev.why);
+        break;
+      case 'workspace-hold':
+        void (ev.on ? this.holdWorkspace(r) : this.releaseWorkspace(c.id, ev.summary))
+          .catch((e) => String(e?.message ?? e))
+          .then((answer) => this.nodeCall(c.nodeId, 'agent.masterReply', { agentId: c.id, id: ev.id, answer }))
+          .catch(() => {});
+        break;
       case 'usage':
         c.usage = { ...c.usage, ...ev.usage };
         break;
@@ -389,7 +428,7 @@ export class Hub extends EventEmitter {
   // stage only changes through approve, merge and check-in.
   private stageFromActivity(r: AgentRec, status: AgentStatus) {
     const c = r.card;
-    if (c.isMaster || c.final || (c.stage && AFTER_AGENT.has(c.stage))) return;
+    if (c.isMaster || c.isWorkspace || c.final || (c.stage && AFTER_AGENT.has(c.stage))) return;
     if (status === 'coding' || status === 'building') c.stage = 'building';
     else if (status === 'testing') c.stage = 'testing';
   }
@@ -435,6 +474,8 @@ export class Hub extends EventEmitter {
     const c = r.card;
     this.stopClock(r);
     this.setBucket(r, null);
+    // The limit it hit isn't news, because it's carrying on with API credits.
+    if (r.switchingCredits) { r.switchingCredits = false; return; }
     if (c.isMaster && !ev.isError) {
       // Its replies aren't worth a popup. When it needs the user it asks a question, which raises one.
       this.unrouted = [];
@@ -478,7 +519,8 @@ export class Hub extends EventEmitter {
   }
 
   private checkAllDone() {
-    const cards = [...this.agents.values()].map((r) => r.card).filter((c) => !c.archived && !c.isMaster);
+    if (this.workspaceHolds.size) return;
+    const cards = [...this.agents.values()].map((r) => r.card).filter((c) => !c.archived && !c.isMaster && !c.isWorkspace);
     const busy = cards.some((c) => LIVE.has(c.status) || (c.status === 'attention' && c.attention?.kind !== 'testing'));
     if (!busy && this.wasBusy && cards.length) {
       this.emitEvent({ e: 'all-done', count: this.testList().filter((t) => !t.done).length });
@@ -578,7 +620,274 @@ export class Hub extends EventEmitter {
       hostAppPath: this.opts.hostAppPath,
       demo: this.opts.demo,
       appUpdate: this.appUpdate,
+      apiCredits: this.creditsView(),
     };
+  }
+
+  // ---- API credits ----
+
+  private creditsView(): ApiCreditsView {
+    const { enabled, key, problem } = this.apiCredits;
+    return { enabled, hasKey: !!key, problem };
+  }
+
+  private creditsChanged() {
+    this.emitEvent({ e: 'api-credits', view: this.creditsView() });
+    this.scheduleSave();
+  }
+
+  setApiCreditsEnabled(on: boolean) {
+    this.apiCredits.enabled = on;
+    if (on) this.apiCredits = { ...this.apiCredits, problem: undefined, failedAt: undefined };
+    this.creditsChanged();
+  }
+
+  setApiKey(key: string | null) {
+    this.apiCredits = { enabled: this.apiCredits.enabled && !!key, key };
+    this.creditsChanged();
+  }
+
+  private canUseCredits() {
+    const { enabled, key, failedAt } = this.apiCredits;
+    return enabled && !!key && (!failedAt || Date.now() - failedAt > CREDITS_RETRY_MS);
+  }
+
+  private async switchToCredits(r: AgentRec, resetsAt?: number) {
+    const c = r.card;
+    c.onApiCredits = true;
+    c.creditsUntil = resetsAt ?? Date.now() + CREDITS_RETRY_MS;
+    const until = resetsAt ? ` until it resets at ${new Date(resetsAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : '';
+    this.note(r, `Hit the subscription's usage limit, so carrying on with API credits${until}.`, 'warn', true);
+    const carryOn = "Your last request was cut off by the subscription's usage limit. You're now on API credits, so carry on from where you stopped.";
+    try {
+      const live = await this.nodeCall<boolean>(c.nodeId, 'agent.useCredits', { agentId: c.id, apiKey: this.apiCredits.key, carryOn });
+      if (!live) {
+        await this.ensureRunning(r);
+        await this.send(c.id, carryOn, undefined, undefined, 'UE Fleet');
+      }
+    } catch (e: any) {
+      c.onApiCredits = false;
+      c.creditsUntil = undefined;
+      c.attention = { kind: 'error', text: `It hit the usage limit and couldn't switch to API credits: ${e?.message ?? e}`.slice(0, 180), at: Date.now() };
+      c.status = 'attention';
+      this.emit('attention', c);
+    }
+    this.dirtyCards.add(c.id);
+    this.scheduleSave();
+  }
+
+  private stopUsingCredits(r: AgentRec) {
+    const c = r.card;
+    c.onApiCredits = false;
+    c.creditsUntil = undefined;
+    this.dirtyCards.add(c.id);
+    this.scheduleSave();
+    void this.nodeCall(c.nodeId, 'agent.useCredits', { agentId: c.id, apiKey: null }).catch(() => {});
+  }
+
+  // The key was refused or the credits ran out. The turn's own error tells the user, and nothing else
+  // tries for a while, so a whole fleet doesn't fail on it one agent at a time.
+  private creditsFailed(r: AgentRec, why: string) {
+    this.apiCredits = { ...this.apiCredits, problem: why.slice(0, 200), failedAt: Date.now() };
+    this.creditsChanged();
+    this.note(r, `API credits aren't available, so it's stopped until the subscription's limit resets: ${why}`, 'error', true);
+    this.stopUsingCredits(r);
+  }
+
+  // Once the limit has reset, or the option's been turned off. Never in the middle of a turn, because
+  // restarting the session would cut it off.
+  private endCredits() {
+    for (const r of this.agents.values()) {
+      const c = r.card;
+      if (!c.onApiCredits || c.archived || (this.apiCredits.enabled && Date.now() < (c.creditsUntil ?? 0))) continue;
+      if (LIVE.has(c.status) || c.attention?.ref) continue;
+      this.note(r, 'Back on the subscription.');
+      this.stopUsingCredits(r);
+    }
+  }
+
+  // ---- Keeping other machines' workspaces up to date ----
+
+  private syncKey(nodeId: string, file: string) { return `${nodeId}|${normalPath(file)}`; }
+  private machineName(nodeId: string) { return this.nodeInfo(nodeId)?.name ?? 'that machine'; }
+
+  // Anything in that workspace that isn't done. Its files are pending there until it's merged, and it's
+  // working from what's on disk, so nothing moves underneath it. Tasks still starting wait for the update.
+  private unfinishedIn(nodeId: string, file: string) {
+    const folder = normalPath(file);
+    return [...this.agents.values()].filter((o) => !o.card.archived && !o.launching && o.card.nodeId === nodeId && normalPath(o.spawn.project?.file ?? '') === folder && o.card.stage !== 'complete' && o.card.status !== 'stopped');
+  }
+
+  // What has already reached this PC from that machine, so its copy there has nothing left to lose.
+  private async deliveredFrom(nodeId: string) {
+    const hashes = new Map<string, Set<string>>();
+    const paths: string[] = [];
+    const add = (rel: string, hash: string) => {
+      const key = normalPath(rel);
+      if (!hashes.has(key)) { hashes.set(key, new Set()); paths.push(rel); }
+      hashes.get(key)!.add(hash);
+    };
+    for (const [rel, list] of Object.entries(this.delivered[nodeId] ?? {})) for (const h of list) add(rel, h);
+    for (const r of this.agents.values()) {
+      if (r.card.nodeId !== nodeId) continue;
+      const dir = this.mergedDir(r.card.id);
+      for (const e of await fsp.readdir(dir, { recursive: true, withFileTypes: true }).catch(() => [] as fs.Dirent[])) {
+        if (e.isFile()) add(path.relative(dir, path.join(e.parentPath, e.name)), await hashOf(path.join(e.parentPath, e.name)));
+      }
+    }
+    return { paths, has: (rel: string, hash?: string) => !!hash && !!hashes.get(normalPath(rel))?.has(hash) };
+  }
+
+  // Sorts what's pending into what can go and what's in the way. Files that aren't under source control
+  // never hold an update up, because an update leaves them alone.
+  private async workspaceOutlook(nodeId: string, file: string, project: string, discard: string[] = []) {
+    const here = this.localInfo.projects.find((p) => !p.received && p.name.toLowerCase() === project.toLowerCase());
+    const follow = here ? await this.nodeCall<{ repo: string; branch: string } | null>(LOCAL_HOST_ID, 'machine.workspaceBranch', { file: here.file }).catch(() => null) : null;
+    const delivered = await this.deliveredFrom(nodeId);
+    const state = await this.nodeCall<(WorkspaceState & { personEditor: boolean }) | null>(nodeId, 'machine.workspaceState', { file, follow, delivered: delivered.paths });
+    if (!state) return null;
+    const dropped = new Set(discard.map(normalPath));
+    const safe = (p: PendingChange) => p.checkedIn || delivered.has(p.path, p.hash) || dropped.has(normalPath(p.path));
+    return {
+      state,
+      behind: state.branch !== state.targetBranch || state.changeset !== state.latest,
+      clear: state.pending.filter(safe),
+      inTheWay: state.pending.filter((p) => !safe(p) && p.status !== 'PR'),
+    };
+  }
+
+  private async syncWorkspace(nodeId: string, file: string, project: string, discard: string[]): Promise<SyncResult> {
+    const name = this.machineName(nodeId);
+    const outlook = await this.workspaceOutlook(nodeId, file, project, discard);
+    if (!outlook) return { outcome: 'current', message: `${project} on ${name} isn't under source control, so there's nothing to update.` };
+    const { state, behind, clear, inTheWay } = outlook;
+    if (!behind) {
+      this.lastSynced[this.syncKey(nodeId, file)] = Date.now();
+      return { outcome: 'current', message: `${name} is already up to date, on changeset ${state.changeset} of ${state.targetBranch}.` };
+    }
+    if (state.personEditor) return { outcome: 'blocked', message: `${name} wasn't updated, because someone has ${project} open in an editor there. It would keep its old assets in memory and could save over what arrives.` };
+    if (inTheWay.length) {
+      const list = inTheWay.slice(0, 15).map((p) => p.path).join(', ');
+      return { outcome: 'blocked', message: `${name} wasn't updated, because ${inTheWay.length} pending change${inTheWay.length === 1 ? '' : 's'} there aren't checked in or merged to this PC: ${list}${inTheWay.length > 15 ? ', and more' : ''}.` };
+    }
+    const res = await this.nodeCall<{ changeset: string }>(nodeId, 'machine.updateWorkspace', { file, targetBranch: state.targetBranch, clear: clear.map((p) => ({ path: p.path, status: p.status, hash: p.hash })) });
+    this.lastSynced[this.syncKey(nodeId, file)] = Date.now();
+    delete this.delivered[nodeId];
+    const moved = state.branch !== state.targetBranch ? `, moving it from ${state.branch}` : '';
+    const cleared = clear.length ? `, clearing ${clear.length} pending change${clear.length === 1 ? '' : 's'} that were already checked in or merged here` : '';
+    return { outcome: 'updated', message: `Updated ${name} to changeset ${res.changeset} of ${state.targetBranch}${moved}${cleared}.` };
+  }
+
+  private runSync(nodeId: string, file: string, project: string, discard: string[] = []) {
+    const key = this.syncKey(nodeId, file);
+    const running = this.workspaceSyncs.get(key);
+    if (running) return running;
+    const work = this.syncWorkspace(nodeId, file, project, discard)
+      .catch((e): SyncResult => ({ outcome: 'failed', message: /Unknown method/.test(String(e?.message)) ? `${this.machineName(nodeId)}'s host is too old to update its workspace, so it needs a new fleet-host.exe first.` : `${this.machineName(nodeId)} couldn't update its workspace: ${e?.message ?? e}` }))
+      .finally(() => { this.workspaceSyncs.delete(key); this.scheduleSave(); });
+    this.workspaceSyncs.set(key, work);
+    return work;
+  }
+
+  // A task starts from recent code if it can, and always starts: nothing here is worth stopping it for.
+  private async freshenWorkspace(rec: AgentRec, file: string, project: string) {
+    const nodeId = rec.card.nodeId;
+    const key = this.syncKey(nodeId, file);
+    const running = this.workspaceSyncs.get(key);
+    if (!running && Date.now() - (this.lastSynced[key] ?? 0) < WORKSPACE_FRESH_MS) return;
+    const unfinished = this.unfinishedIn(nodeId, file);
+    if (!running && unfinished.length) {
+      this.queuedSyncs.set(key, { nodeId, file, project });
+      this.note(rec, `${this.machineName(nodeId)} is due for an update, but agent ${unfinished.map((o) => pad2(o.card.index)).join(', ')} is mid-task there, so this starts from what's on disk. It'll update once they're done.`);
+      return;
+    }
+    rec.card.status = 'provisioning';
+    rec.card.detail = 'Getting the latest changes';
+    this.dirtyCards.add(rec.card.id);
+    const res = await (running ?? this.runSync(nodeId, file, project));
+    if (res.outcome === 'updated') this.note(rec, res.message);
+    else if (res.outcome !== 'current') this.note(rec, `${res.message} This starts from what's on disk.`, 'warn', true);
+  }
+
+  private runQueuedSyncs() {
+    for (const [key, q] of this.queuedSyncs) {
+      if (this.workspaceSyncs.has(key) || !this.link.nodes.get(q.nodeId)?.online || this.unfinishedIn(q.nodeId, q.file).length) continue;
+      this.queuedSyncs.delete(key);
+      this.scheduleSave();
+      void this.runSync(q.nodeId, q.file, q.project).then((res) => this.reportSync(res));
+    }
+  }
+
+  private reportSync(res: SyncResult) {
+    if (res.outcome !== 'current') this.note(this.masterRec, res.message, res.outcome === 'updated' ? undefined : 'warn', true);
+  }
+
+  // ---- The workspace chat ----
+
+  private holdOn(file?: string | null) { return !!file && this.workspaceHolds.has(normalPath(file)); }
+
+  private othersInFolder(r: AgentRec) {
+    const file = normalPath(r.spawn.project?.file ?? '');
+    return [...this.agents.values()].filter((o) => o !== r && !o.card.archived && o.card.nodeId === r.card.nodeId && normalPath(o.spawn.project?.file ?? '') === file);
+  }
+
+  // Another agent carrying on while its files change underneath it could lose work, or get swept up
+  // in what's being merged. A work in progress can't be paused, so it's interrupted and told afterwards.
+  private async holdWorkspace(r: AgentRec): Promise<string> {
+    const file = r.spawn.project?.file;
+    if (!file) return "This chat has no project, so there's nothing to hold.";
+    this.workspaceHolds.set(normalPath(file), r.card.id);
+    r.card.holdingWorkspace = true;
+    this.dirtyCards.add(r.card.id);
+    this.scheduleSave();
+    const others = this.othersInFolder(r);
+    await Promise.all(others.map(async (o) => {
+      const c = o.card;
+      if (LIVE.has(c.status) || c.attention?.ref) {
+        c.pausedForWorkspace = true;
+        this.note(o, 'Paused while the workspace chat changes the workspace.', 'warn', true);
+        await this.interrupt(c.id).catch(() => {});
+      }
+      await this.stopInstance(c.id).catch(() => {});
+    }));
+    const { personEditor } = await this.nodeCall<{ personEditor: boolean }>(r.card.nodeId, 'machine.projectQuiet', { file });
+    const agents = await Promise.all(others.map(async (o) => ({
+      agent: o.card.index, title: o.card.title, stage: o.card.stage, paused: !!o.card.pausedForWorkspace,
+      changedFiles: (await this.changes(o.card.id).catch(() => [] as ChangedFile[])).map((f) => f.path),
+    })));
+    return JSON.stringify({ agents, personEditorOpen: personEditor }, null, 2);
+  }
+
+  async releaseWorkspace(agentId: string, summary?: string): Promise<string> {
+    const r = this.need(agentId);
+    const file = r.spawn.project?.file;
+    if (!file || !r.card.holdingWorkspace) return 'Nothing was on hold.';
+    this.workspaceHolds.delete(normalPath(file));
+    r.card.holdingWorkspace = false;
+    this.dirtyCards.add(agentId);
+    this.scheduleSave();
+    for (const wake of this.holdWaiters.splice(0)) wake();
+    const changed = summary ? `: ${summary}` : '';
+    let carrying = 0;
+    for (const o of this.othersInFolder(r)) {
+      if (o.heldNew) {
+        o.heldNew = false;
+        void this.launch(o, o.sourceProjectDir ?? null);
+        carrying++;
+      } else if (o.card.pausedForWorkspace) {
+        o.card.pausedForWorkspace = false;
+        void this.send(o.card.id, `The workspace chat has finished changing the workspace${changed}. Files may have changed under you, and your editor was stopped. Re-read anything you were relying on, rebuild if code changed, and carry on.`, undefined, undefined, 'UE Fleet').catch(() => {});
+        carrying++;
+      }
+    }
+    this.checkAllDone();
+    return `${carrying} agents are carrying on.`;
+  }
+
+  // Work coming back from another machine waits too, or it would land in the middle of a merge.
+  private async workspaceFree(r: AgentRec) {
+    const file = this.masterProjectFile(r) ?? r.spawn.project?.file;
+    while (this.holdOn(file)) await new Promise<void>((wake) => this.holdWaiters.push(wake));
   }
 
   private safePairing() { try { return this.link.pairing(); } catch { return null; } }
@@ -631,6 +940,8 @@ export class Hub extends EventEmitter {
       case 'agent.interrupt':
       case 'agent.stop': return this.master().interrupt();
       case 'agent.has': return true;
+      case 'agent.useCredits': this.master().useCredits(p.apiKey, p.carryOn); return true;
+      case 'agent.setOptions': await this.master().setOptions(p.options); return true;
       case 'agent.changes': return [];
       case 'agent.log': return '';
       default: return null;
@@ -644,20 +955,71 @@ export class Hub extends EventEmitter {
       if (!r) throw new Error(`There's no agent ${n}.`);
       return r;
     };
+    const machineNamed = (name: string) => {
+      const m = this.machines().find((x) => x.info.name.toLowerCase() === name.toLowerCase());
+      if (!m) throw new Error(`There's no machine called ${name}. Connected: ${this.machines().map((x) => x.info.name).join(', ')}.`);
+      return m;
+    };
+    // One line per agent, so one that fails doesn't hide what happened to the rest.
+    const each = async (agents: number[], act: (r: AgentRec) => Promise<string>) => (await Promise.all(agents.map(async (n) => {
+      try { return `${pad2(n)}: ${await act(byNumber(n))}`; } catch (e: any) { return `${pad2(n)}: ${e?.message ?? e}`; }
+    }))).join('\n');
+    const workspaceOn = (a: { machine: string; project?: string }) => {
+      const m = machineNamed(a.machine);
+      const wanted = a.project ?? (this.defaults.projectFile ? path.basename(this.defaults.projectFile, '.uproject') : undefined);
+      const own = m.info.projects.filter((p) => !p.received);
+      const project = own.find((p) => p.name.toLowerCase() === wanted?.toLowerCase()) ?? (a.project ? undefined : own[0]);
+      if (!project) throw new Error(`${m.info.name} has no workspace for ${wanted ?? 'that project'}. It has: ${own.map((p) => p.name).join(', ') || 'none'}.`);
+      return { m, project };
+    };
     return {
-      machines: () => this.machines().map((m) => ({ name: m.info.name, online: m.online, cpuPercent: m.stats?.cpu, freeRamGb: m.stats ? m.info.ramGb - m.stats.ramUsedGb : undefined, agents: this.liveOn(m.info.id), maxEditors: m.info.maxInstances, projects: m.info.projects.map((p) => p.name) })),
-      agents: () => [...this.agents.values()].map((r) => r.card).filter((c) => !c.archived && !c.isMaster).map((c) => ({ number: c.index, title: c.title, stage: c.stage, status: c.status, machine: nameOf(c.nodeId), project: c.project, progress: c.progress, needsUser: c.attention?.text, said: c.lastText.slice(0, 300) })),
+      // Not waited for, because the session being changed is the one waiting on this tool.
+      setOwnPermissions: async (a) => {
+        void this.setMasterPermissions(a.mode);
+        return `This chat now uses ${a.mode} permissions.`;
+      },
+      workspaceStatus: async (a) => {
+        const { m, project } = workspaceOn(a);
+        const outlook = await this.workspaceOutlook(m.info.id, project.file, project.name);
+        if (!outlook) return `${project.name} on ${m.info.name} isn't under source control.`;
+        const { state, behind, clear, inTheWay } = outlook;
+        const key = this.syncKey(m.info.id, project.file);
+        return JSON.stringify({
+          machine: m.info.name, project: project.name, branch: state.branch, changeset: state.changeset, targetBranch: state.targetBranch, latest: state.latest, behind,
+          personEditorOpen: state.personEditor, unfinishedAgents: this.unfinishedIn(m.info.id, project.file).map((o) => o.card.index), updateWaiting: this.queuedSyncs.has(key), updating: this.workspaceSyncs.has(key),
+          lastUpdated: this.lastSynced[key] ? new Date(this.lastSynced[key]).toLocaleString() : null,
+          safeToClear: clear.length, inTheWay: inTheWay.map((p) => `${p.status} ${p.path}`),
+        }, null, 2);
+      },
+      updateWorkspace: async (a) => {
+        const { m, project } = workspaceOn(a);
+        const nodeId = m.info.id;
+        if (nodeId === LOCAL_HOST_ID) return "That's this PC, where the user works, so it isn't updated this way. Use open_workspace_chat, which checks with them first.";
+        const key = this.syncKey(nodeId, project.file);
+        const unfinished = this.unfinishedIn(nodeId, project.file);
+        if (unfinished.length && !this.workspaceSyncs.has(key)) {
+          this.queuedSyncs.set(key, { nodeId, file: project.file, project: project.name });
+          this.scheduleSave();
+          return `${m.info.name} has work in progress there (agent ${unfinished.map((o) => pad2(o.card.index)).join(', ')}), so it'll update as soon as that's finished.`;
+        }
+        const work = this.runSync(nodeId, project.file, project.name, a.discard);
+        const done = await Promise.race([work, new Promise<null>((r) => setTimeout(() => r(null), SYNC_WAIT_MS))]);
+        if (done) return done.message;
+        void work.then((res) => this.reportSync(res));
+        return `${m.info.name} is still updating, which can take a while. The result will appear in this chat.`;
+      },
+      machines: () => this.machines().map((m) => ({ name: m.info.name, online: m.online, cpuPercent: m.stats?.cpu, freeRamGb: m.stats ? m.info.ramGb - m.stats.ramUsedGb : undefined, agents: this.liveOn(m.info.id), maxEditors: m.info.maxInstances, projects: m.info.projects.map((p) => p.name), update: m.update?.stage })),
+      agents: () => [...this.agents.values()].map((r) => r.card).filter((c) => !c.archived && !c.isMaster).map((c) => ({ number: c.index, title: c.title, stage: c.stage, status: c.status, machine: nameOf(c.nodeId), project: c.project, model: c.model, effort: c.effort, permissions: c.permissionMode, onApiCredits: c.onApiCredits, workspaceChat: c.isWorkspace, pausedForWorkspace: c.pausedForWorkspace, progress: c.progress, needsUser: c.attention?.text, said: c.lastText.slice(0, 300) })),
       startTask: async (a) => {
         const opts = this.masterOptions ?? { ...this.defaults, nodeId: 'auto', prompt: '' };
         const known = this.localInfo.projects;
         const named = a.project ? known.find((p) => p.name.toLowerCase() === a.project!.toLowerCase()) : undefined;
         if (a.project && !named) throw new Error(`There's no project called ${a.project} on this PC. It has: ${known.map((p) => p.name).join(', ')}.`);
-        const machine = a.machine ? this.machines().find((m) => m.info.name.toLowerCase() === a.machine!.toLowerCase()) : undefined;
-        if (a.machine && !machine) throw new Error(`There's no machine called ${a.machine}. Connected: ${this.machines().map((m) => m.info.name).join(', ')}.`);
+        const machine = a.machine ? machineNamed(a.machine) : undefined;
         const images = opts.images;
         if (this.masterOptions) this.masterOptions.images = undefined;
         this.unrouted = [];
-        const id = await this.createAgent({ ...opts, prompt: a.prompt, images, projectFile: named?.file ?? opts.projectFile, nodeId: machine?.info.id ?? opts.nodeId }, a.title);
+        const id = await this.createAgent({ ...opts, ...chosenOptions(a), prompt: a.prompt, images, projectFile: named?.file ?? opts.projectFile, nodeId: machine?.info.id ?? opts.nodeId }, a.title);
         const c = this.need(id).card;
         return `Started agent ${pad2(c.index)} "${c.title}" on ${nameOf(c.nodeId)}.`;
       },
@@ -669,12 +1031,112 @@ export class Hub extends EventEmitter {
       },
       answerAgent: async (a) => this.answerQuestion(a.request_id, a.answer),
       assignChangelist: async (a) => this.assignChangelist(byNumber(a.agent), a.name, a.description),
+      openWorkspaceChat: async (a) => {
+        const known = this.localInfo.projects.filter((p) => !p.received);
+        const project = a.project ? known.find((p) => p.name.toLowerCase() === a.project!.toLowerCase()) : known.find((p) => p.file === this.defaults.projectFile) ?? known[0];
+        if (!project) throw new Error(`There's no ${a.project ? `project called ${a.project}` : 'project'} on this PC to open it on. It has: ${known.map((p) => p.name).join(', ') || 'none'}.`);
+        const open = [...this.agents.values()].find((r) => r.card.isWorkspace && !r.card.archived && normalPath(r.spawn.project?.file ?? '') === normalPath(project.file));
+        if (open) {
+          await this.send(open.card.id, a.prompt);
+          return `Agent ${pad2(open.card.index)} is already the workspace chat for ${project.name}, so this went to it.`;
+        }
+        const opts = this.masterOptions ?? { ...this.defaults, nodeId: 'auto', prompt: '' };
+        const id = await this.createAgent({ ...opts, images: undefined, permissionMode: DEFAULT_PERMISSION_MODE, prompt: a.prompt, projectFile: project.file, nodeId: LOCAL_HOST_ID, workspace: true, demo: this.opts.demo ? 'reply' : undefined }, a.title ?? `Workspace: ${project.name}`);
+        return `Opened agent ${pad2(this.need(id).card.index)} as the workspace chat for ${project.name}.`;
+      },
+      agentDetails: async (a) => {
+        const { card: c } = byNumber(a.agent);
+        const files = await this.changes(c.id).catch(() => [] as ChangedFile[]);
+        const recent = this.transcript(c.id).filter((t) => t.kind === 'user' || t.kind === 'assistant').slice(-8).map((t) => ({ from: t.kind, text: (t as { text: string }).text.slice(0, 1000) }));
+        return JSON.stringify({ number: c.index, title: c.title, stage: c.stage, status: c.status, machine: nameOf(c.nodeId), project: c.project, model: c.model, effort: c.effort, permissions: c.permissionMode, progress: c.progress, needsUser: c.attention?.text, finalReport: c.final, merge: c.merge, changelist: c.changelist, filesChanged: files.map((f) => f.path), recent }, null, 2);
+      },
+      setAgentOptions: async (a) => {
+        const options = chosenOptions(a);
+        if (!Object.keys(options).length) throw new Error('Pass a model, effort or permission_mode to change.');
+        return each(a.agents, (r) => this.setAgentOptions(r.card.id, options));
+      },
+      interruptAgents: (a) => each(a.agents, async (r) => { await this.interrupt(r.card.id); return 'interrupted'; }),
+      stopAgents: (a) => each(a.agents, async (r) => { await this.stopAgent(r.card.id); return 'stopped'; }),
+      archiveAgents: (a) => each(a.agents, async (r) => {
+        const lost = a.discard_unmerged ? [] : await this.unmergedFiles(r);
+        if (lost.length) return `not archived, because ${lost.length} changed files haven't been merged and would be lost: ${lost.slice(0, 10).join(', ')}`;
+        await this.archive(r.card.id);
+        return 'archived';
+      }),
+      approveAgents: (a) => each(a.agents, async (r) => {
+        const c = r.card;
+        if (c.stage !== 'testing') return `it's at ${c.stage ?? 'no stage'}, so there's nothing to approve`;
+        await this.approve(c.id);
+        const conflicts = c.merge?.conflicts?.length;
+        return conflicts ? `approved, but ${conflicts} files conflict, so resolve_conflicts has to settle them` : `approved, now at ${c.stage}`;
+      }),
+      reportIssue: async (a) => {
+        const r = byNumber(a.agent);
+        await this.reportIssue(r.card.id, a.text);
+        return `Sent it back to agent ${pad2(r.card.index)}.`;
+      },
+      openTestEditor: async (a) => {
+        const r = byNumber(a.agent);
+        void this.testChanges(r.card.id).catch((e) => this.note(r, `Couldn't open the editor: ${e?.message ?? e}`, 'error'));
+        return "Pulling its changes and opening the editor. Its card shows how that's going.";
+      },
+      resolveConflicts: async (a) => {
+        const r = byNumber(a.agent);
+        if (!r.card.merge?.conflicts?.length) return `Agent ${pad2(r.card.index)} has no conflicts.`;
+        await this.resolveConflicts(r.card.id, a.keep);
+        return `Kept ${a.keep === 'agent' ? "the agent's" : "the user's"} version, and agent ${pad2(r.card.index)} is now at ${r.card.stage}.`;
+      },
+      stopEditors: (a) => each(a.agents, async (r) => { await this.stopInstance(r.card.id); return 'editor stopped'; }),
+      setMaxEditors: async (a) => {
+        const m = machineNamed(a.machine);
+        await this.setMaxInstances(m.info.id, a.max);
+        return `${m.info.name} can now run ${a.max} editors at once.`;
+      },
+      restartHost: async (a) => {
+        const m = machineNamed(a.machine);
+        if (m.update?.stage !== 'waiting') return `${m.info.name} has no new version waiting.`;
+        await this.restartHost(m.info.id);
+        return `Restarting ${m.info.name} into its new version. Its agents carry on when it's back.`;
+      },
     };
+  }
+
+  // From the top of its chat, or by asking it.
+  async setMasterPermissions(mode: string) {
+    if (!MASTER_PERMISSION_MODES.includes(mode)) throw new Error(`The master chat can't use ${mode}.`);
+    return this.setAgentOptions(MASTER_CHAT_ID, { permissionMode: mode });
+  }
+
+  // Takes effect from the agent's next model call, and stays through a restart.
+  private async setAgentOptions(agentId: string, o: AgentOptions) {
+    const r = this.need(agentId);
+    Object.assign(r.card, o);
+    Object.assign(r.spawn, o);
+    this.dirtyCards.add(agentId);
+    this.scheduleSave();
+    const c = r.card;
+    this.note(r, `Now on ${modelLabel(c.model)} at ${c.effort} effort, with ${c.permissionMode} permissions.`);
+    const saved = 'saved for when it next runs';
+    if (r.notStarted) return saved;
+    try {
+      const live = await this.nodeCall<boolean>(c.nodeId, 'agent.setOptions', { agentId, options: o });
+      return live ? 'changed' : saved;
+    } catch (e: any) {
+      return `${saved}, because its machine couldn't change it now: ${e?.message ?? e}. If that machine has an update waiting, restart_host applies both.`;
+    }
+  }
+
+  // Archiving frees a private copy, which would wipe anything not merged yet. Work in a shared folder
+  // stays where it is.
+  private async unmergedFiles(r: AgentRec) {
+    const merged = ['merged', 'checking-in', 'complete'].includes(r.card.stage ?? '');
+    if (r.card.slot?.shared || merged) return [];
+    return (await this.changes(r.card.id)).map((f) => f.path);
   }
 
   // A new task from the user. It always gets somewhere: if the master can't run, it starts directly.
   async request(task: NewTask): Promise<string> {
-    this.defaults = { model: task.model, effort: task.effort, permissionMode: task.permissionMode, instanceMode: task.instanceMode, projectFile: task.projectFile };
+    this.defaults = { model: task.model, effort: task.effort, permissionMode: DEFAULT_PERMISSION_MODE, instanceMode: task.instanceMode, projectFile: task.projectFile };
     this.unrouted.push(task);
     this.scheduleSave();
     await this.route(task);
@@ -734,15 +1196,17 @@ export class Hub extends EventEmitter {
   private async merge(r: AgentRec, force?: string[]): Promise<boolean> {
     const c = r.card;
     try {
+      await this.workspaceFree(r);
       const files = (await this.changes(c.id)).filter((f) => !f.usuallySkipped && !r.keepMine?.includes(f.path)).map((f) => f.path);
       const add = (list: string[]) => { r.pulled = [...new Set([...(r.pulled ?? []), ...list])]; };
       if (c.slot?.shared && c.nodeId === 'master') add(files);
       else if (files.length) {
         const res = await this.apply(c.id, files, force);
         add([...res.applied, ...res.merged]);
+        if (res.merged.length) this.note(r, `Merged ${res.merged.length} file${res.merged.length === 1 ? '' : 's'} with what was already in your workspace, keeping both sets of changes:\n${res.merged.join('\n')}`, undefined, true);
         if (res.conflicts.length) {
           c.merge = { files: r.pulled?.length ?? 0, conflicts: res.conflicts };
-          c.attention = { kind: 'error', text: `${res.conflicts.length} file${res.conflicts.length === 1 ? '' : 's'} also changed in your workspace. Choose which to keep.`, at: Date.now() };
+          c.attention = { kind: 'error', text: `${res.conflicts.length} file${res.conflicts.length === 1 ? '' : 's'} couldn't be merged with your workspace. Choose which to keep.`, at: Date.now() };
           this.emit('attention', c);
           return false;
         }
@@ -866,7 +1330,7 @@ export class Hub extends EventEmitter {
     await this.send(agentId, `I tested this and found a problem:\n\n${text}\n\nFix it, test what you can yourself, and call finish_task again with a fresh checklist.`);
   }
 
-  async resolveConflicts(agentId: string, choice: 'agent' | 'mine') {
+  async resolveConflicts(agentId: string, choice: 'agent' | 'mine' | 'retry') {
     const r = this.need(agentId);
     const c = r.card;
     const paths = (c.merge?.conflicts ?? []).map((f) => f.path);
@@ -879,13 +1343,12 @@ export class Hub extends EventEmitter {
 
   async createAgent(task: NewTask, givenTitle?: string): Promise<string> {
     const id = crypto.randomBytes(5).toString('hex');
-    this.defaults = { model: task.model, effort: task.effort, permissionMode: task.permissionMode, instanceMode: task.instanceMode, projectFile: task.projectFile };
     const project = task.projectFile ? readProject(task.projectFile, this.localInfo.engines) : null;
     const placed = task.nodeId === 'auto' ? placeTask(this.machines(), this.liveOn, project) : { nodeId: task.nodeId, reason: '' };
     const nodeId = placed.nodeId;
     const title = givenTitle ?? titleFrom(task.prompt);
     const card: AgentCard = {
-      id, index: this.nextIndex++, title, nodeId, project: project?.name ?? null, stage: 'preparing',
+      id, index: this.nextIndex++, title, nodeId, project: project?.name ?? null, stage: task.workspace ? undefined : 'preparing', isWorkspace: task.workspace,
       model: task.model, effort: task.effort, permissionMode: task.permissionMode, instanceMode: task.instanceMode,
       status: 'queued', attention: null, lastText: '', lastTextAt: 0, lastPrompt: task.prompt, lastPromptAt: Date.now(),
       createdAt: Date.now(), sessionMs: 0, runningSince: Date.now(),
@@ -893,7 +1356,7 @@ export class Hub extends EventEmitter {
       tokens: 0, tps: 0, spark: [], buckets: emptyBuckets(), slot: null, final: null,
     };
     const spawn: AgentSpawn = {
-      id, prompt: task.prompt, images: task.images, title, model: task.model, effort: task.effort, permissionMode: task.permissionMode, instanceMode: task.instanceMode, demo: task.demo,
+      id, prompt: task.prompt, images: task.images, title, model: task.model, effort: task.effort, permissionMode: task.permissionMode, instanceMode: task.instanceMode, demo: task.demo, workspace: task.workspace,
       project: project ? { name: project.name, file: project.file, engineRoot: nodeId === 'master' ? this.localInfo.engines.find((e) => e.id === project.engineAssociation)?.root : undefined } : null,
     };
     const rec: AgentRec = { card, transcript: [], byId: new Map(), bucket: null, bucketSince: Date.now(), tokensThisTick: 0, lastSeq: 0, pendingItems: new Map(), pendingDeltas: new Map(), spawn, sourceProjectDir: project?.dir, notStarted: nodeId !== 'master' && !!project };
@@ -902,7 +1365,11 @@ export class Hub extends EventEmitter {
     this.wasBusy = true;
     this.scheduleSave();
     if (placed.reason && this.machines().length > 1) this.note(rec, `Placed here: ${placed.reason}`);
-    void this.launch(rec, project?.dir ?? null, project?.engineVersion);
+    if (nodeId === LOCAL_HOST_ID && !task.workspace && this.holdOn(project?.file)) {
+      rec.heldNew = true;
+      card.detail = 'Waiting for the workspace chat';
+      this.note(rec, "Waiting for the workspace chat to finish changing the workspace. It'll start after that.", 'warn', true);
+    } else void this.launch(rec, project?.dir ?? null, project?.engineVersion);
     this.emitEvent({ e: 'task-started', id });
     return id;
   }
@@ -926,6 +1393,7 @@ export class Hub extends EventEmitter {
           const others = copies.slice(1).map((p) => p.dir).join(', ');
           this.note(rec, `Using the copy of ${name} already on ${node!.info.name}: ${own.dir}${others ? `. Also found ${others}. To choose, run fleet-host.exe --project "<folder>" on that machine.` : ''}`);
           rec.spawn.project = { name, file: own.file };
+          await this.freshenWorkspace(rec, own.file, name);
         } else {
           rec.card.status = 'provisioning';
           rec.card.detail = 'Sending project to the machine';
@@ -1023,6 +1491,10 @@ export class Hub extends EventEmitter {
     r.card.attention = null;
     r.card.runningSince = r.card.runningSince ?? Date.now();
     this.dirtyCards.add(agentId);
+    if (r.heldNew) {
+      r.spawn.prompt = `${r.spawn.prompt}\n\n${text}`;
+      return;
+    }
     if (r.notStarted) {
       // It never reached its machine, so try again from the start, carrying what was just said.
       this.stopSend(r);
@@ -1033,6 +1505,8 @@ export class Hub extends EventEmitter {
       void this.launch(r, r.sourceProjectDir ?? null, project?.engineVersion);
       return;
     }
+    const updating = r.spawn.project ? this.workspaceSyncs.get(this.syncKey(r.card.nodeId, r.spawn.project.file)) : undefined;
+    if (updating) await updating;
     await this.ensureRunning(r);
     await this.nodeCall(r.card.nodeId, 'agent.send', { agentId, text, images, broadcastId, from });
   }
@@ -1041,7 +1515,10 @@ export class Hub extends EventEmitter {
   private async ensureRunning(r: AgentRec) {
     const has = await this.nodeCall<boolean>(r.card.nodeId, 'agent.has', { agentId: r.card.id }).catch(() => false);
     if (has) return;
-    await this.nodeCall(r.card.nodeId, 'agent.spawn', { ...r.spawn, resumeSessionId: r.card.sessionId, slotDir: r.slotDir, startPrompt: false, seqFrom: r.lastSeq });
+    // Another machine may know this engine by another name, as it does a custom build, so it needs the version too.
+    const file = this.masterProjectFile(r);
+    const engineVersion = file ? readProject(file, this.localInfo.engines)?.engineVersion : undefined;
+    await this.nodeCall(r.card.nodeId, 'agent.spawn', { ...r.spawn, engineVersion, apiKey: r.card.onApiCredits ? this.apiCredits.key ?? undefined : undefined, resumeSessionId: r.card.sessionId, slotDir: r.slotDir, startPrompt: false, seqFrom: r.lastSeq });
   }
 
   broadcast(text: string, targets: string[]) {
@@ -1114,7 +1591,9 @@ export class Hub extends EventEmitter {
     const r = this.need(agentId);
     if (r.card.isMaster) return;
     this.stopSend(r);
+    if (r.card.holdingWorkspace) await this.releaseWorkspace(agentId).catch(() => {});
     await this.nodeCall(r.card.nodeId, 'agent.stop', { agentId, releaseSlot: true, slotDir: r.slotDir }).catch(() => {});
+    await fsp.rm(this.mergedDir(agentId), { recursive: true, force: true }).catch(() => {});
     r.card.archived = true;
     r.card.attention = null;
     this.dirtyCards.add(agentId);
@@ -1169,7 +1648,29 @@ export class Hub extends EventEmitter {
   async apply(agentId: string, only?: string[], force?: string[]): Promise<ApplyResult> {
     const r = this.need(agentId);
     if (r.card.nodeId === 'master') return this.nodeCall(r.card.nodeId, 'agent.apply', { ...this.whereOf(r), only, force });
-    return this.applyFromRemote(r, only, force);
+    // One at a time. A merge on reconnecting can overlap with Open editor, and both write the same files.
+    const turn = (r.applying ?? Promise.resolve()).then(() => this.applyFromRemote(r, only, force));
+    r.applying = turn.catch(() => {});
+    return turn;
+  }
+
+  private mergedDir(agentId: string) { return path.join(this.opts.dataDir, 'merged', agentId); }
+
+  // What both sides started from, as in a version control merge. Once this agent's work has come over
+  // that's the version that came last time, or a task sent back would conflict with its own earlier
+  // work. Before that it's what source control has on the agent's machine.
+  private async mergeBase(r: AgentRec, rel: string, lastMerged: string): Promise<Buffer | null> {
+    const last = await fsp.readFile(lastMerged).catch(() => null);
+    if (last) return last;
+    const base = await this.nodeCall<string | null>(r.card.nodeId, 'agent.baseText', { ...this.whereOf(r), path: rel }).catch(() => null);
+    return base === null ? null : Buffer.from(base, 'base64');
+  }
+
+  // A binary can't be merged, but replacing it is safe if it's still what the agent started from.
+  private async unchangedSinceBase(r: AgentRec, rel: string, target: string, lastMerged: string) {
+    if (fs.existsSync(lastMerged)) return sameBytes(target, lastMerged);
+    const hash = await this.nodeCall<string | null>(r.card.nodeId, 'agent.baseHash', { ...this.whereOf(r), path: rel }).catch(() => null);
+    return !!hash && hash === await hashOf(target);
   }
 
   // Pulls changed files from the other machine, then applies them to the real project here.
@@ -1183,12 +1684,13 @@ export class Hub extends EventEmitter {
     for (const c of changes) {
       if (only && !only.includes(c.path)) continue;
       const target = path.join(dest, c.path);
-      if (c.kind === 'deleted') { await fsp.rm(target, { force: true }); result.applied.push(c.path); continue; }
-      // A shared folder keeps no base version to merge from, so a file that also changed here since
-      // the task started is left for the user to decide about.
+      const forced = force.includes(c.path);
       const here = await fsp.stat(target).catch(() => null);
-      if (r.card.slot?.shared && here && here.mtimeMs >= r.card.createdAt && here.mtimeMs !== r.applied?.get(c.path) && !force.includes(c.path)) {
-        result.conflicts.push({ path: c.path, reason: 'Also changed on this machine since the task started.' });
+      const changedHere = !forced && !!r.card.slot?.shared && !!here && here.mtimeMs >= r.card.createdAt && here.mtimeMs !== r.applied?.get(c.path);
+      if (c.kind === 'deleted') {
+        if (changedHere) { result.conflicts.push({ path: c.path, reason: 'The agent deleted it, but it also changed on this machine.' }); continue; }
+        await fsp.rm(target, { force: true });
+        result.applied.push(c.path);
         continue;
       }
       let offset = 0;
@@ -1199,15 +1701,27 @@ export class Hub extends EventEmitter {
         if (chunk.last) break;
       }
       const incoming = path.join(inbox, c.path);
-      const exists = fs.existsSync(target);
-      const base = !isBinaryPath(c.path) && exists ? await this.nodeCall<string | null>(r.card.nodeId, 'agent.baseText', { ...this.whereOf(r), path: c.path }) : null;
+      const lastMerged = path.join(this.mergedDir(agentId), c.path);
+      const binary = isBinaryPath(c.path);
+      const existing = !!here && !forced;
       try {
-        if (exists && base !== null && !force.includes(c.path)) {
-          const merged = await mergeText(target, Buffer.from(base, 'base64'), incoming);
-          if (!merged.clean) { result.conflicts.push({ path: c.path, reason: 'Text merge has conflicts.' }); continue; }
+        // Choosing the agent's side still merges. That machine's whole file may be from an older
+        // changeset, and only the lines in dispute are what was chosen.
+        const base = here && !binary ? await this.mergeBase(r, c.path, lastMerged) : null;
+        // Nothing new from the agent means nothing to do, whatever else has changed here since.
+        if ((here && await sameBytes(target, incoming)) || (base && (await fsp.readFile(incoming)).equals(base))) {
+          result.applied.push(c.path);
+        } else if (base) {
+          const merged = await mergeText(target, base, incoming, forced);
+          if (!merged.clean) { result.conflicts.push({ path: c.path, reason: merged.text.length ? 'Both sides changed the same lines, so it needs a decision.' : "It can't be merged as text." }); continue; }
           await fsp.writeFile(`${target}.fleet-merge`, merged.text);
           await fsp.rename(`${target}.fleet-merge`, target);
           result.merged.push(c.path);
+        } else if (existing && r.card.slot?.shared && !(binary && await this.unchangedSinceBase(r, c.path, target, lastMerged))) {
+          // That machine may be on an older changeset, so its whole file can hold far more than this
+          // agent's work, and copying it over could undo newer check-ins here.
+          result.conflicts.push({ path: c.path, reason: binary ? "It's a binary file that's different on both sides, so it can't be merged." : `It's different on this machine, and ${NO_MERGE_BASE}.` });
+          continue;
         } else {
           await fsp.mkdir(path.dirname(target), { recursive: true });
           await fsp.copyFile(incoming, `${target}.fleet-in`);
@@ -1215,6 +1729,10 @@ export class Hub extends EventEmitter {
           result.applied.push(c.path);
         }
         (r.applied ??= new Map()).set(c.path, (await fsp.stat(target)).mtimeMs);
+        const fromThere = (this.delivered[r.card.nodeId] ??= {});
+        fromThere[c.path] = [...new Set([...(fromThere[c.path] ?? []), await hashOf(incoming)])];
+        await fsp.mkdir(path.dirname(lastMerged), { recursive: true });
+        await fsp.copyFile(incoming, lastMerged);
       } catch (e: any) {
         result.conflicts.push({ path: c.path, reason: String(e?.message ?? e) });
       }
@@ -1249,10 +1767,10 @@ export class Hub extends EventEmitter {
   }
 
   saveNow() {
-    const agents = [...this.agents.values()].map((r) => ({ card: r.card, spawn: { ...r.spawn, images: undefined }, slotDir: r.slotDir, lastSeq: r.lastSeq, sourceProjectDir: r.sourceProjectDir, notStarted: r.notStarted, pulled: r.pulled, keepMine: r.keepMine, resumeOnReturn: r.resumeOnReturn }));
+    const agents = [...this.agents.values()].map((r) => ({ card: r.card, spawn: { ...r.spawn, images: undefined }, slotDir: r.slotDir, lastSeq: r.lastSeq, sourceProjectDir: r.sourceProjectDir, notStarted: r.notStarted, pulled: r.pulled, keepMine: r.keepMine, resumeOnReturn: r.resumeOnReturn, heldNew: r.heldNew }));
     fs.mkdirSync(this.opts.dataDir, { recursive: true });
     const tmp = `${this.stateFile()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ agents, nextIndex: this.nextIndex, defaults: this.defaults, doneTests: [...this.doneTests], broadcasts: this.broadcasts, openQuestions: [...this.openQuestions], unrouted: this.unrouted.map((t) => ({ ...t, images: undefined })) }));
+    fs.writeFileSync(tmp, JSON.stringify({ agents, nextIndex: this.nextIndex, defaults: this.defaults, doneTests: [...this.doneTests], broadcasts: this.broadcasts, openQuestions: [...this.openQuestions], unrouted: this.unrouted.map((t) => ({ ...t, images: undefined })), creditsEnabled: this.apiCredits.enabled, workspaceHolds: [...this.workspaceHolds], queuedSyncs: [...this.queuedSyncs], lastSynced: this.lastSynced, delivered: this.delivered }));
     fs.renameSync(tmp, this.stateFile());
   }
 
@@ -1260,18 +1778,25 @@ export class Hub extends EventEmitter {
     let saved: any;
     try { saved = JSON.parse(fs.readFileSync(this.stateFile(), 'utf8')); } catch { return; }
     this.nextIndex = saved.nextIndex ?? 1;
-    this.defaults = saved.defaults ?? this.defaults;
+    this.defaults = { ...(saved.defaults ?? this.defaults), permissionMode: DEFAULT_PERMISSION_MODE };
     this.doneTests = new Set(saved.doneTests ?? []);
     this.broadcasts = saved.broadcasts ?? [];
     this.openQuestions = new Map(saved.openQuestions ?? []);
     this.unrouted = saved.unrouted ?? [];
+    this.apiCredits.enabled = !!saved.creditsEnabled;
+    this.workspaceHolds = new Map(saved.workspaceHolds ?? []);
+    this.queuedSyncs = new Map(saved.queuedSyncs ?? []);
+    this.lastSynced = saved.lastSynced ?? {};
+    this.delivered = saved.delivered ?? {};
     for (const a of saved.agents ?? []) {
       const card: AgentCard = a.card;
       if (card.archived) continue;
       const transcript = this.readTranscript(card.id);
       const byId = new Map(transcript.map((t) => [t.id, t]));
       // A card from before stages existed. A finished one still needs approving before it merges.
-      if (!card.isMaster) card.stage ??= card.final ? 'testing' : 'building';
+      if (!card.isMaster && !card.isWorkspace) card.stage ??= card.final ? 'testing' : 'building';
+      // It starts a new session on the subscription, and goes back to credits if it hits the limit.
+      if (card.isMaster) card.onApiCredits = undefined;
       // Runs inside the app ended with it, so show them as idle. Ones on a host, including this PC's
       // own, report in when it links, and reconcile catches any that didn't survive.
       if (((card.nodeId === LOCAL_HOST_ID && this.local) || card.isMaster) && LIVE.has(card.status)) card.status = 'idle';
@@ -1280,7 +1805,7 @@ export class Hub extends EventEmitter {
       if (a.notStarted) card.status = 'stopped';
       card.runningSince = null;
       card.tps = 0;
-      this.agents.set(card.id, { card, transcript, byId, bucket: null, bucketSince: Date.now(), tokensThisTick: 0, lastSeq: a.lastSeq ?? 0, pendingItems: new Map(), pendingDeltas: new Map(), slotDir: a.slotDir, spawn: a.spawn, sourceProjectDir: a.sourceProjectDir, notStarted: a.notStarted, pulled: a.pulled, keepMine: a.keepMine, resumeOnReturn: a.resumeOnReturn });
+      this.agents.set(card.id, { card, transcript, byId, bucket: null, bucketSince: Date.now(), tokensThisTick: 0, lastSeq: a.lastSeq ?? 0, pendingItems: new Map(), pendingDeltas: new Map(), slotDir: a.slotDir, spawn: a.spawn, sourceProjectDir: a.sourceProjectDir, notStarted: a.notStarted, pulled: a.pulled, keepMine: a.keepMine, resumeOnReturn: a.resumeOnReturn, heldNew: a.heldNew });
     }
   }
 
@@ -1315,6 +1840,12 @@ export class Hub extends EventEmitter {
 }
 
 function oneLine(s: string) { return s.replace(/\s+/g, ' ').trim().slice(0, 140); }
+const normalPath = (p: string) => p.replaceAll('\\', '/').toLowerCase();
+
+async function sameBytes(a: string, b: string) {
+  const [x, y] = await Promise.all([fsp.stat(a), fsp.stat(b)]);
+  return x.size === y.size && (await fsp.readFile(a)).equals(await fsp.readFile(b));
+}
 
 export function titleFrom(prompt: string) {
   const first = prompt.split(/\r?\n/).find((l) => l.trim()) ?? 'New task';

@@ -9,7 +9,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import type { ChangedFile, EngineInfo, InstanceMode, ProjectInfo, SlotInfo, SlotState } from '../shared/protocol';
 import { forgetCopiesFromRecents, readProjectSettings } from './machine';
-import { freeLoadedModules, isBinaryPath, seedAssetCache, seedSaves, syncProject, type SyncProgress } from './projectSync';
+import { freeFiles, freeLoadedModules, isBinaryPath, seedAssetCache, seedSaves, syncProject, type SyncProgress } from './projectSync';
 
 const q = (s: string) => `"${s}"`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -361,11 +361,21 @@ export class Slot {
       // UBT's mutex is per engine, not per project. Each copy has its own Intermediate, so it's safe
       // to skip, as long as nothing relinks a source engine's DLLs under every running editor. A
       // shared folder keeps it, so this waits for a build the user started from Visual Studio.
-      const args = [target, 'Win64', opts.config ?? 'Development', `-Project=${q(this.projectFile)}`, this.shared ? '-WaitMutex' : '-NoMutex', `-MaxParallelActions=${share}`, '-NoHotReload', ...(this.engine!.source ? ['-NoEngineChanges'] : [])];
-      const out = await runCaptured(bat, args, this.dir);
+      const args = [target, 'Win64', opts.config ?? 'Development', `-Project=${q(this.projectFile)}`, this.shared ? '-WaitMutex' : '-NoMutex', `-MaxParallelActions=${share}`, '-NoHotReload'];
+      let out = await runCaptured(bat, this.engine!.source ? [...args, '-NoEngineChanges'] : args, this.dir);
+      let rebuilt = '';
+      // A source engine that's out of date gets rebuilt, the same as building from an IDE. Only from
+      // the real project: a copy is refused because of its own path, and building would tie the engine
+      // to that copy and break it for everything else.
+      if (out.code !== 0 && this.shared && ENGINE_CHANGE.test(out.text)) {
+        this.setState('building', 'Rebuilding the editor');
+        await freeFiles(engineFilesToReplace(out.text));
+        out = await runCaptured(bat, args, this.dir);
+        rebuilt = 'The engine was out of date, so the editor was rebuilt as well.\n';
+      }
       const ok = out.code === 0;
       this.setState('cold');
-      return { ok, output: summarizeBuild(out.text), ms: Date.now() - t0 };
+      return { ok, output: rebuilt + summarizeBuild(out.text), ms: Date.now() - t0 };
     } finally {
       this.mgr.builds.release();
     }
@@ -422,6 +432,16 @@ export class Slot {
     for (const g of this.games.splice(0)) killTree(g.pid);
   }
 
+  // Modules built for a different build of the engine. Opening an editor on those makes it offer to
+  // rebuild them itself, which it can't do for a source engine.
+  binariesOutOfDate() {
+    if (!this.engine || !fs.existsSync(path.join(this.project.dir, 'Source'))) return false;
+    const buildId = (root: string) => {
+      try { return JSON.parse(fs.readFileSync(path.join(root, 'Binaries/Win64/UnrealEditor.modules'), 'utf8')).BuildId as string; } catch { return null; }
+    };
+    return buildId(this.project.dir) !== buildId(path.join(this.engine.root, 'Engine'));
+  }
+
   // A real editor for a person to test in, using their own settings, so it stays connected to source
   // control. Live Coding stays off, or Unreal would refuse every agent's build while this is open.
   // It isn't tied to this process, so restarting the app or the host leaves it open.
@@ -471,7 +491,7 @@ export function personEditors(processes: { pid: number; commandLine: string }[],
   return processes.filter((p) => norm(p.commandLine).includes(file) && !/-UserDir=/i.test(p.commandLine)).map((p) => p.pid);
 }
 
-function unrealProcesses(): Promise<{ pid: number; commandLine: string }[]> {
+export function unrealProcesses(): Promise<{ pid: number; commandLine: string }[]> {
   return new Promise((resolve) => {
     const script = "Get-CimInstance Win32_Process -Filter \"Name='UnrealEditor.exe'\" | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }";
     const p = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
@@ -495,6 +515,15 @@ function runCaptured(exe: string, args: string[], cwd: string): Promise<{ code: 
     p.on('error', reject);
     p.on('exit', (code) => resolve({ code: code ?? 1, text }));
   });
+}
+
+const ENGINE_CHANGE = /FailedDueToEngineChange/;
+
+// What a build, refused for changing a source engine, says it would have replaced.
+export function engineFilesToReplace(text: string) {
+  const lines = text.split(/\r?\n/);
+  const from = lines.findIndex((l) => /Building would modify/i.test(l));
+  return from < 0 ? [] : lines.slice(from + 1).map((l) => l.trim()).filter((l) => /^[a-z]:[\\/]/i.test(l));
 }
 
 export function summarizeBuild(text: string): string {

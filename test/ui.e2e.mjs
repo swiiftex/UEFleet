@@ -1,6 +1,7 @@
 // Drives the real Electron app with real key presses, using scripted agents.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,11 +13,18 @@ fs.mkdirSync(shots, { recursive: true });
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-ui-'));
 const require = createRequire(import.meta.url);
 
+// Stands in for Anthropic when a key is saved, so a test key never leaves this PC.
+const fakeApi = http.createServer((req, res) => {
+  res.writeHead(req.headers['x-api-key'] === 'bad-key' ? 401 : 200, { 'content-type': 'application/json' });
+  res.end('{"data":[]}');
+});
+await new Promise((r) => fakeApi.listen(0, '127.0.0.1', r));
+
 const app = await electron.launch({
   executablePath: require('electron'),
   args: [root],
   cwd: root,
-  env: { ...process.env, FLEET_DEMO: '1', FLEET_DATA: dataDir, FLEET_TEST_UNSEEN: '1' },
+  env: { ...process.env, FLEET_DEMO: '1', FLEET_DATA: dataDir, FLEET_TEST_UNSEEN: '1', ANTHROPIC_BASE_URL: `http://127.0.0.1:${fakeApi.address().port}` },
 });
 const page = await app.firstWindow();
 const errors = [];
@@ -50,6 +58,21 @@ const until = async (fn, what, ms = 15000) => {
 await step('first run shows the empty state', async () => {
   await page.waitForSelector('.empty');
   await page.screenshot({ path: path.join(shots, '01-empty.png') });
+});
+
+await step('New Task always opens on auto, even after a different pick', async () => {
+  const mode = () => page.$eval('[data-permission-mode]', (e) => e.value);
+  await page.keyboard.press('Control+n');
+  await page.waitForSelector('[data-new-task]');
+  if (await mode() !== 'auto') throw new Error(`Opened on ${await mode()}`);
+  await page.selectOption('[data-permission-mode]', 'default');
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('[data-new-task]', { state: 'detached' });
+  await page.keyboard.press('Control+n');
+  await page.waitForSelector('[data-new-task]');
+  await until(async () => (await mode()) === 'auto', 'it to reopen on auto');
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('[data-new-task]', { state: 'detached' });
 });
 
 let longId;
@@ -402,11 +425,68 @@ await step('it is remembered, and turning it off brings everything back', async 
   await page.waitForSelector('.transcript .tool');
 });
 
+await step('the master opens a workspace chat, outlined in pink and pinned above every other card', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-ui-workspace-'));
+  const file = path.join(dir, 'Greenhouse.uproject');
+  fs.writeFileSync(file, '{"EngineAssociation":"5.8"}');
+  await page.evaluate((f) => window.fleet.call('addProject', f), file);
+  await page.keyboard.press('Control+0');
+  await page.evaluate(() => window.fleet.call('send', 'master-chat', 'Open a workspace chat and merge main into dev'));
+  await page.waitForSelector('[data-pinned] .card.workspace', { timeout: 15000 });
+  const first = await page.evaluate(() => document.querySelector('.grid-scroll').firstElementChild.matches('[data-pinned]'));
+  assert.equal(first, true, 'it is the first thing in the list');
+  const outline = await page.evaluate(() => { const s = getComputedStyle(document.querySelector('.card.workspace')); return `${s.borderColor} ${s.boxShadow}`; });
+  assert.match(outline, /rgb\(244, 114, 182\)/, 'pink, because blue means selected');
+  assert.equal(await page.evaluate(() => document.querySelector('.card.workspace .flow-steps')), null, 'a chat, so no stages');
+  await page.waitForSelector('[data-workspace-banner]', { timeout: 10000 });
+  assert.match(await page.evaluate(() => document.querySelector('[data-workspace-banner]').innerText), /merge, switch and update/);
+  assert.equal(await page.evaluate(() => document.querySelector('[data-flow]')), null);
+  await page.screenshot({ path: path.join(shots, '17-workspace-chat.png') });
+});
+
+await step("the master chat's permissions can be changed from the top of its chat, without bypass on offer", async () => {
+  await page.keyboard.press('Control+0');
+  await page.waitForSelector('[data-master-mode]');
+  const master = async () => (await page.evaluate(() => window.fleet.call('snapshot'))).cards.find((c) => c.isMaster).permissionMode;
+  assert.equal(await page.$eval('[data-master-mode]', (e) => e.value), 'default');
+  assert.deepEqual(await page.$$eval('[data-master-mode] option', (o) => o.map((x) => x.value)), ['default', 'auto', 'acceptEdits']);
+  await page.selectOption('[data-master-mode]', 'auto');
+  await until(async () => (await master()) === 'auto', 'it to change');
+  await until(() => page.$eval('[data-master-mode]', (e) => e.value === 'auto'), 'the screen to show it');
+  await page.screenshot({ path: path.join(shots, '19-master-mode.png') });
+});
+
+await step('Use API credits needs a working key, and the key never comes back to the screen', async () => {
+  await page.click('.topbar button:has-text("machines")');
+  await page.waitForSelector('[data-api-credits]');
+  assert.equal(await page.evaluate(() => document.querySelector('[data-api-credits-on]').disabled), true, 'nothing to use yet');
+  await page.fill('[data-api-key]', 'bad-key');
+  await page.click('[data-api-key-save]');
+  await page.waitForSelector('[data-api-credits-problem]');
+  assert.match(await page.evaluate(() => document.querySelector('[data-api-credits-problem]').innerText), /refused/);
+  assert.equal(await page.evaluate(() => document.querySelector('[data-api-credits-on]').disabled), true);
+  await page.fill('[data-api-key]', 'sk-ant-good-test-key');
+  await page.click('[data-api-key-save]');
+  await until(() => page.evaluate(() => !document.querySelector('[data-api-credits-on]').disabled), 'the option to be available');
+  await until(() => page.evaluate(() => document.querySelector('[data-api-key]').value === ''), 'the box to be emptied');
+  await page.click('[data-api-credits-on]');
+  await until(async () => (await page.evaluate(() => window.fleet.call('snapshot'))).apiCredits.enabled, 'it to turn on');
+  const snap = await page.evaluate(() => window.fleet.call('snapshot'));
+  assert.ok(!JSON.stringify(snap).includes('sk-ant-good-test-key'), 'not in anything the screens get');
+  assert.ok(!fs.readFileSync(path.join(dataDir, 'api-key.bin')).includes('sk-ant-good-test-key'), 'encrypted on disk');
+  await page.screenshot({ path: path.join(shots, '18-api-credits.png') });
+  await page.click('[data-api-key-remove]');
+  await until(() => page.evaluate(() => document.querySelector('[data-api-credits-on]').disabled), 'it to turn off with no key');
+  assert.equal(fs.existsSync(path.join(dataDir, 'api-key.bin')), false);
+  await page.keyboard.press('Escape');
+});
+
 await step('no renderer errors', async () => {
   assert.deepEqual(errors, []);
 });
 
 await app.close();
+fakeApi.close();
 const failed = results.filter((r) => r.startsWith('FAIL'));
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
 process.exit(failed.length ? 1 : 0);

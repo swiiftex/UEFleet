@@ -12,8 +12,8 @@ export type CmRun = (args: string[]) => Promise<string>;
 
 export const isPlasticWorkspace = (dir: string) => fs.existsSync(path.join(dir, '.plastic'));
 
-export function realCm(dir: string): CmRun {
-  return async (args) => (await exec('cm', args, { cwd: dir, windowsHide: true, maxBuffer: 1 << 28, timeout: 5 * 60_000 })).stdout;
+export function realCm(dir: string, timeout = 5 * 60_000): CmRun {
+  return async (args) => (await exec('cm', args, { cwd: dir, windowsHide: true, maxBuffer: 1 << 28, timeout })).stdout;
 }
 
 // Lines look like CO+RP|c:\workspace\Source\A.cpp|False|NO_MERGES.

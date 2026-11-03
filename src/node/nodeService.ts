@@ -1,14 +1,16 @@
 // Everything one machine can do, independent of who's asking. The master calls this
 // in-process; the remote host exposes the same methods over its link to the master.
 import { EventEmitter } from 'node:events';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import type { AgentEvent, AgentSpawn, ApplyResult, ChangedFile, ImageAttachment, NodeEvent, NodeInfo, ProjectInfo } from '../shared/protocol';
+import type { AgentEvent, AgentOptions, AgentSpawn, ApplyResult, ChangedFile, ImageAttachment, NodeEvent, NodeInfo, ProjectInfo } from '../shared/protocol';
 import { AgentRunner } from './agentRunner';
 import { DemoRunner } from './demoRunner';
 import { appendPrompt, FLEET_TOOLS, fleetServer } from './fleetTools';
-import { Slot, SlotManager } from './instance';
+import { personEditors, Slot, SlotManager, unrealProcesses } from './instance';
+import { checkedInVersion, readWorkspace, updateWorkspace, workspaceBranch, type PendingChange } from './sourceControl';
 import { describeMachine, discoverProjects, projectMemoryDir, readProject, readProjectSettings, resolveEngine, statsSampler } from './machine';
 import { applyChanges, baseText, buildManifest, changedSince, listChanges, planReceive, readChunk, writeChunk, type ManifestEntry } from './projectSync';
 
@@ -151,7 +153,7 @@ export class NodeService extends EventEmitter {
     const server = fleetServer(live.slot, (report) => {
       emit({ k: 'final', report });
       void live.slot?.stopEditor();
-    }, (percent) => emit({ k: 'progress', percent }), (q) => this.askMaster(spawn.id, q));
+    }, (percent) => emit({ k: 'progress', percent }), (q) => this.askMaster(spawn.id, q), spawn.workspace ? (on, summary) => this.holdWorkspace(spawn.id, on, summary) : undefined);
     const settings = project ? readProjectSettings(project.dir) : {};
     live.runner = new AgentRunner({
       spawn,
@@ -161,7 +163,7 @@ export class NodeService extends EventEmitter {
       // out, so nothing can reach the user's real editor by accident.
       mcpServers: { ...settings.mcpServers, fleet: server },
       allowedTools: FLEET_TOOLS,
-      appendPrompt: appendPrompt(live.slot, settings.agentNotes),
+      appendPrompt: appendPrompt(live.slot, settings.agentNotes, spawn.workspace),
       memoryDir: project ? projectMemoryDir(project.dir) : null,
       emit,
       onFileEdited: (f) => live.slot?.noteChanged(f),
@@ -184,6 +186,19 @@ export class NodeService extends EventEmitter {
   decide(agentId: string, itemId: string, decision: 'allow' | 'always' | 'deny') { this.need(agentId).runner.decide(itemId, decision); }
   answer(agentId: string, itemId: string, answers: Record<string, string>) { this.need(agentId).runner.answer(itemId, answers); }
   interrupt(agentId: string) { return this.need(agentId).runner.interrupt(); }
+  async setOptions(agentId: string, o: AgentOptions) {
+    const a = this.agents.get(agentId);
+    if (!a) return false;
+    Object.assign(a.spawn, o);
+    await a.runner?.setOptions(o);
+    return true;
+  }
+  useCredits(agentId: string, apiKey: string | null, carryOn?: string) {
+    const a = this.agents.get(agentId);
+    if (!a?.runner) return false;
+    a.runner.useCredits(apiKey, carryOn);
+    return true;
+  }
 
   async stop(agentId: string, releaseSlot = false, slotDir?: string) {
     const a = this.agents.get(agentId);
@@ -235,23 +250,56 @@ export class NodeService extends EventEmitter {
   // Base64, because this crosses the machine link as JSON and has to arrive byte for byte.
   async agentBaseText(where: AgentFolder, rel: string) {
     const slot = this.folderOf(where);
-    const base = slot && !slot.shared ? await baseText(slot.dir, rel) : null;
+    if (!slot) return null;
+    const base = slot.shared ? await checkedInVersion(slot.dir, rel) : await baseText(slot.dir, rel);
     return base ? base.toString('base64') : null;
   }
+  // A binary is too big to send just to compare, so only its hash comes back.
+  async agentBaseHash(where: AgentFolder, rel: string) {
+    const slot = this.folderOf(where);
+    const base = slot?.shared ? await checkedInVersion(slot.dir, rel) : null;
+    return base ? crypto.createHash('sha256').update(base).digest('hex') : null;
+  }
 
-  // The agent waits on its tool call. The answer comes back from the master through masterReply.
-  private askMaster(agentId: string, question: string): Promise<string> {
+  // The agent waits on its tool call. The answer comes back from the hub through masterReply.
+  private awaitReply(agentId: string, tooLong: string, ask: (id: string) => void): Promise<string> {
     const id = `q${this.nextQuestion++}-${Date.now().toString(36)}`;
     const key = `${agentId}:${id}`;
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.questions.delete(key);
-        resolve("The master didn't answer in time. Carry on with what you have, and say in your final message what you couldn't find out.");
+        resolve(tooLong);
       }, MASTER_ANSWER_TIMEOUT_MS);
       this.questions.set(key, (answer) => { clearTimeout(timer); resolve(answer); });
+      ask(id);
+    });
+  }
+  private askMaster(agentId: string, question: string) {
+    return this.awaitReply(agentId, "The master didn't answer in time. Carry on with what you have, and say in your final message what you couldn't find out.", (id) => {
       this.emitAgent(agentId, { k: 'activity', status: 'working', bucket: 'waiting', detail: 'Asking the master' });
       this.emitAgent(agentId, { k: 'ask-master', id, question });
     });
+  }
+  private holdWorkspace(agentId: string, on: boolean, summary?: string) {
+    return this.awaitReply(agentId, "That didn't finish in time. Don't change the workspace until it has: tell the user.", (id) => this.emitAgent(agentId, { k: 'workspace-hold', id, on, summary }));
+  }
+  async workspaceState(file: string, follow?: { repo: string; branch: string } | null, delivered?: string[]) {
+    const state = await readWorkspace(path.dirname(file), follow, delivered);
+    return state && { ...state, personEditor: personEditors(await unrealProcesses(), file).length > 0 };
+  }
+  // Waits its turn with builds. Any editor still up here would hold on to old assets and code, and
+  // could save over what arrives.
+  updateWorkspace(file: string, targetBranch: string, clear: Pick<PendingChange, 'path' | 'status' | 'hash'>[]) {
+    const dir = path.dirname(file);
+    return this.slots.gate(dir).run(async () => {
+      await Promise.all([...this.agents.values()].filter((a) => a.slot?.dir === dir).map((a) => a.slot!.stopEditor()));
+      return updateWorkspace(dir, { targetBranch, clear });
+    });
+  }
+  // Once nothing's building in this project, and whether a person has an editor open on it.
+  async projectQuiet(file: string) {
+    await this.slots.gate(path.dirname(file)).idle();
+    return { personEditor: personEditors(await unrealProcesses(), file).length > 0 };
   }
   masterReply(agentId: string, id: string, answer: string) {
     const key = `${agentId}:${id}`;
@@ -274,7 +322,7 @@ export class NodeService extends EventEmitter {
       slot = await this.slots.acquire({ ...project, received: false }, engine, id, 'windowed');
       slot.forPerson = true;
     }
-    if (build) {
+    if (build || slot.binariesOutOfDate()) {
       const r = await slot.build({});
       if (!r.ok) return { ok: false, output: r.output };
     }
@@ -328,12 +376,19 @@ export class NodeService extends EventEmitter {
       case 'agent.decide': return this.decide(p.agentId, p.itemId, p.decision);
       case 'agent.answer': return this.answer(p.agentId, p.itemId, p.answers);
       case 'agent.interrupt': return this.interrupt(p.agentId);
+      case 'agent.setOptions': return this.setOptions(p.agentId, p.options);
+      case 'agent.useCredits': return this.useCredits(p.agentId, p.apiKey, p.carryOn);
+      case 'machine.projectQuiet': return this.projectQuiet(p.file);
+      case 'machine.workspaceBranch': return workspaceBranch(path.dirname(p.file));
+      case 'machine.workspaceState': return this.workspaceState(p.file, p.follow, p.delivered);
+      case 'machine.updateWorkspace': return this.updateWorkspace(p.file, p.targetBranch, p.clear);
       case 'agent.stop': return this.stop(p.agentId, p.releaseSlot, p.slotDir);
       case 'agent.has': return this.has(p.agentId);
       case 'agent.changes': return this.changes(p, p.all);
       case 'agent.apply': return this.apply(p, p.only, p.force);
       case 'agent.readFile': return this.readAgentFile(p, p.path, p.offset);
       case 'agent.baseText': return this.agentBaseText(p, p.path);
+      case 'agent.baseHash': return this.agentBaseHash(p, p.path);
       case 'agent.masterReply': return this.masterReply(p.agentId, p.id, p.answer);
       case 'machine.openTestEditor': return this.openTestEditor(p.file, p.build);
       case 'machine.addProject': return this.addProject(p.file);

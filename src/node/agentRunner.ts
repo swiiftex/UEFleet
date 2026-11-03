@@ -1,7 +1,7 @@
 // Drives one Claude Code session through the Agent SDK and normalises everything it does
 // into AgentEvents, so the hub never has to know about SDK message shapes.
 import { query, type McpServerConfig, type PermissionResult, type PermissionUpdate, type Query, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
-import type { ActivityBucket, AgentEvent, AgentSpawn, AgentStatus, ImageAttachment, Question } from '../shared/protocol';
+import type { ActivityBucket, AgentEvent, AgentOptions, AgentSpawn, AgentStatus, ImageAttachment, Question } from '../shared/protocol';
 import { agentEnv } from './machine';
 
 class InputQueue implements AsyncIterable<SDKUserMessage> {
@@ -38,6 +38,8 @@ export interface RunnerConfig {
 
 type Pending = { resolve: (r: PermissionResult) => void; input: Record<string, unknown>; suggestions?: PermissionUpdate[] };
 
+const USAGE_LIMIT = /^You('ve| have) (hit|reached) your/;
+const CREDITS_REFUSED = /credit balance|invalid x-api-key/i;
 const CODING_TOOLS = /^(Edit|Write|MultiEdit|NotebookEdit)$/;
 const BUILD_CMD = /\b(Build\.bat|UnrealBuildTool|RunUAT|msbuild|cl\.exe)\b/i;
 
@@ -76,10 +78,15 @@ export class AgentRunner {
   private lastOutput = 0;
   private stopped = false;
   private interrupted = false;
+  private apiKey: string | undefined;
+  private usageLimit: { resetsAt?: number } | null = null;
+  private creditsProblem: string | null = null;
+  private restarting: { carryOn?: string } | null = null;
   running = false;
 
   constructor(private cfg: RunnerConfig) {
     this.sessionId = cfg.spawn.resumeSessionId;
+    this.apiKey = cfg.spawn.apiKey;
   }
 
   private id(prefix: string) { return `${prefix}-${Date.now().toString(36)}-${++this.seqId}`; }
@@ -132,15 +139,15 @@ export class AgentRunner {
           settingSources: ['user', 'project', 'local'],
           settings: this.cfg.memoryDir ? { autoMemoryDirectory: this.cfg.memoryDir } : undefined,
           pathToClaudeCodeExecutable: claudePath ?? undefined,
-          env: agentEnv(),
+          env: this.apiKey ? { ...agentEnv(), ANTHROPIC_API_KEY: this.apiKey } : agentEnv(),
           canUseTool: (name, input, opts) => this.onPermission(name, input, opts as any),
           stderr: (d) => { if (/error|fatal/i.test(d)) console.error(`[agent ${spawn.id}]`, d.trim()); },
         },
       });
       for await (const m of this.q) this.onMessage(m as any);
-      this.emit({ k: 'ended', reason: 'closed' });
+      if (!this.restarting) this.emit({ k: 'ended', reason: 'closed' });
     } catch (e: any) {
-      if (!this.stopped) {
+      if (!this.stopped && !this.restarting) {
         const msg = String(e?.message ?? e);
         this.emit({ k: 'item', item: { kind: 'system', id: this.id('s'), at: Date.now(), text: msg, tone: 'error' } });
         this.emit({ k: 'attention', kind: 'error', text: msg.slice(0, 140) });
@@ -150,11 +157,15 @@ export class AgentRunner {
       this.q = null;
       this.running = false;
       this.input = new InputQueue();
+      const restart = this.restarting;
+      this.restarting = null;
+      if (restart?.carryOn) this.send(restart.carryOn, undefined, undefined, 'UE Fleet');
     }
   }
 
   private onMessage(m: any) {
     switch (m.type) {
+      case 'rate_limit_event': return this.onRateLimit(m.rate_limit_info);
       case 'system': return this.onSystem(m);
       case 'stream_event': return this.onStream(m);
       case 'assistant': return this.onAssistant(m);
@@ -162,6 +173,12 @@ export class AgentRunner {
       case 'tool_progress': return;
       case 'result': return this.onResult(m);
     }
+  }
+
+  // With extra usage turned on for the account the CLI carries on by itself, so that isn't a limit here.
+  private onRateLimit(info: any) {
+    if (info?.status !== 'rejected' || info.overageStatus === 'allowed' || info.overageStatus === 'allowed_warning') return;
+    this.usageLimit = { resetsAt: info.resetsAt ? info.resetsAt * 1000 : undefined };
   }
 
   private onSystem(m: any) {
@@ -237,6 +254,7 @@ export class AgentRunner {
       }
     }
     if (m.error) this.emit({ k: 'item', item: { kind: 'system', id: this.id('s'), at: Date.now(), text: `Assistant error: ${m.error}`, tone: 'error' } });
+    if (this.apiKey && (m.error === 'billing_error' || m.error === 'authentication_failed')) this.creditsProblem = m.error;
   }
 
   private onUserEcho(m: any) {
@@ -274,7 +292,13 @@ export class AgentRunner {
     } });
     const interrupted = this.interrupted;
     this.interrupted = false;
-    this.emit({ k: 'turn-end', interrupted, isError: !interrupted && (!!m.is_error || m.subtype !== 'success'), text: typeof m.result === 'string' ? m.result : (m.errors ?? []).join('\n') });
+    const isError = !interrupted && (!!m.is_error || m.subtype !== 'success');
+    const text = typeof m.result === 'string' ? m.result : (m.errors ?? []).join('\n');
+    if (isError && this.apiKey && (this.creditsProblem || CREDITS_REFUSED.test(text))) this.emit({ k: 'credits-failed', why: text || this.creditsProblem! });
+    else if (isError && !this.apiKey && (this.usageLimit || USAGE_LIMIT.test(text))) this.emit({ k: 'usage-limit', resetsAt: this.usageLimit?.resetsAt });
+    this.usageLimit = null;
+    this.creditsProblem = null;
+    this.emit({ k: 'turn-end', interrupted, isError, text });
   }
 
   private onPermission(toolName: string, input: Record<string, unknown>, opts: { signal: AbortSignal; suggestions?: PermissionUpdate[]; decisionReason?: string }): Promise<PermissionResult> {
@@ -313,6 +337,25 @@ export class AgentRunner {
     p.resolve({ behavior: 'allow', updatedInput: { ...p.input, answers } });
     this.emit({ k: 'attention-clear', ref: itemId });
     this.emit({ k: 'activity', status: 'working', bucket: 'thinking' });
+  }
+
+  // The same conversation carries on billed to this key, or back on the subscription without one. A
+  // running session can't change what it's signed in with, so this restarts it from where it is.
+  useCredits(apiKey: string | null, carryOn?: string) {
+    this.apiKey = apiKey ?? undefined;
+    if (this.q) {
+      this.restarting = { carryOn };
+      this.q.close();
+    } else if (carryOn) this.send(carryOn, undefined, undefined, 'UE Fleet');
+  }
+
+  // The session uses these from its next model call. With none running, the next one starts on them.
+  async setOptions(o: AgentOptions) {
+    Object.assign(this.cfg.spawn, o);
+    if (!this.q) return;
+    if (o.permissionMode) await this.q.setPermissionMode(o.permissionMode as any);
+    if (o.model) await this.q.setModel(o.model);
+    if (o.effort) await this.q.applyFlagSettings({ effortLevel: o.effort as any });
   }
 
   async interrupt() {

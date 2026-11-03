@@ -8,4 +8,5 @@ contextBridge.exposeInMainWorld('fleet', {
   copy: (text: string) => ipcRenderer.invoke('app:copy', text),
   reveal: (p: string) => ipcRenderer.invoke('app:reveal', p),
   applyUpdate: () => ipcRenderer.invoke('app:applyUpdate'),
+  setApiKey: (key: string | null) => ipcRenderer.invoke('app:setApiKey', key),
 });

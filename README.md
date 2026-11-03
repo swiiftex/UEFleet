@@ -37,7 +37,27 @@ It can't edit files, and it doesn't do the task itself. If it can't run, your re
 
 **Placement** is automatic unless you pick a machine. A task goes to another PC when one is free, meaning CPU under 60% and at least 12 GB of RAM free, with room for another editor and a copy of the project. Otherwise it stays on this PC. If this PC is out of room too, it goes to the least busy machine, even if that means sending the project. The card says why it ended up where it did.
 
+**Its permissions:** it starts out asking first. Change that with the dropdown at the top of its chat or by telling it, such as "switch to auto". The change applies straight away and stays through a restart.
+
+**Managing the fleet:** you can also tell it what to do with the agents, such as "put everything on xhigh and auto" or "stop 4 and archive 5". It can change a running agent's model, effort and permissions, which apply from its next model call, as well as interrupt, stop, archive, approve, send back with an issue, open the test editor, settle merge conflicts, stop editors, set how many editors a machine runs, and restart a machine into a waiting update. It won't archive work that would be lost without asking you, and it can't turn on **Bypass all prompts**, because it reads tickets and documents that shouldn't be able to talk it into that. Pick that in New Task instead.
+
+**The workspace chat:** merging branches, switching and updating change the workspace under everyone in it, so normal agents aren't allowed to. Ask the master instead, and it opens a workspace chat, one per project, on this PC in the real project. Its card has a pink outline and stays pinned above the others. Before it changes anything it puts the workspace on hold, which pauses the other agents in that project on this PC, stops their editors, holds back new tasks and work coming back from other machines, and shows it everyone's pending changes. It asks you before touching any of those, and it never checks in unless you say to. When it's done, or when you press **Let agents carry on**, the agents pick up again knowing what changed.
+
+**Other machines' workspaces:** a task starting on another PC gets the latest changes first if that PC hasn't been updated for 30 minutes, and you can ask the master to check or update one at any time. It brings that PC onto this PC's branch at its latest changeset, which only moves the workspace and loses nothing that's checked in.
+
+It never happens mid-task. If unfinished work is in that workspace, the update waits and runs once it's done, and a new task there starts from what's on disk in the meantime. Before updating, every pending change there is checked. One that's identical to a checked-in version, or to what already reached this PC, gets cleared. Anything else stops the update and is listed for you, because undoing a change in Plastic can't be taken back. Files that aren't under source control are left alone. So is this PC's workspace, because you work in it: that's what the workspace chat is for.
+
 **Agents asking back:** this PC may be the only one logged into Jira, Codevelop and the like. Any agent, on any machine, can call `ask_master`, and it waits while the master looks the answer up, asking you first if only you know. If the app restarts in the meantime, the question gets asked again.
+
+## API credits
+
+**Use API credits if available**, under Machines, lets work carry on when your subscription runs out. It's off until you turn it on, and it needs an API key from console.anthropic.com. The key is encrypted for your Windows account, never comes back to the screen, and only goes to a machine when one of its agents needs it, for as long as that session runs.
+
+Agents always start on your subscription. One that hits a usage limit restarts its session with the key and carries on with the same conversation, with an **API credits** tag on its card. Once the limit resets it goes back at the end of its current turn. Turning the option off does the same. It spends real money from the organisation that owns the key, and the card shows no warning beyond that tag.
+
+If the key is refused or the credits run out, that agent stops and says why, the Machines window shows the problem, and nothing tries again for 30 minutes unless you turn the option off and on.
+
+This is separate from extra usage on your Claude plan, which is an account setting at claude.ai. With that on, the CLI carries on by itself and none of this comes into it.
 
 ## How an instance works
 
@@ -81,7 +101,7 @@ The panel at the top of each task always shows which stage it's at, where its fi
 | **Preparing** | Getting set up and reading |
 | **Building** | The agent is making the change and compiling |
 | **Testing** | The agent tests its own work, then hands you a checklist if anything needs a person. An agent that proved its change works skips your part |
-| **Awaiting merge** | Bringing its files into your workspace. Pauses if a file also changed there |
+| **Awaiting merge** | Bringing its files into your workspace, merging any that also changed there. Pauses only if both changed the same lines |
 | **Merged** | Its files are in your workspace |
 | **Checking in** | The master chat puts them in a named Plastic changelist |
 | **Complete** | Done. You check the changelist in from Plastic when you're ready |
@@ -100,7 +120,11 @@ When a task needs you, you get a checklist with exact steps and what you should 
 
 ### Where the files are
 
-An agent on the machine holding your workspace works directly in it, so merging is only a matter of noting which files are its own. An agent on another machine works in that machine's project folder, and merging copies its files over the link into your workspace. A file that also changed in your workspace since the task started pauses for you to pick **Use the agent's version** or **Keep mine**.
+An agent on the machine holding your workspace works directly in it, so merging is only a matter of noting which files are its own. An agent on another machine works in that machine's project folder, and merging brings its files over the link into your workspace.
+
+A text file that also changed in your workspace gets a three-way merge, like version control, so edits to different parts of a file both land. The common ancestor is the version that machine's Plastic or git has for the changeset its workspace is on, so a newer check-in on your side isn't undone either. If the task comes back for more work, the ancestor is what was merged last time. A merge works on bytes, so line endings and non-UTF-8 characters survive, and the chat lists any file it merged.
+
+It only pauses for you when both sides changed the same lines, when a binary such as an asset changed on both sides, or when there's nothing to merge from, as with a new file on both sides. Then you pick **Use the agent's changes**, **Keep mine** or **Try merging again**. Using the agent's changes settles only the lines in dispute in its favour, and everything else in your file stays. Only a binary, or a file with nothing to merge from, is replaced whole.
 
 Each agent keeps track of which files are its own: what its tools edited, what its editor saved, and what it says it changed when it finishes. A change made some other way that it doesn't report won't be merged or go in the changelist. The **Files** tab shows that list, and can also scan for everything that changed in the folder. On Night Crew that scan takes about half a minute, and it can't show deleted files.
 

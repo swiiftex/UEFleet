@@ -380,6 +380,7 @@ export function describeMachine(id: string, role: NodeInfo['role'], version: str
     projects,
     claudePath: findClaude(),
     version,
+    sharedMergeBase: true,
   };
 }
 

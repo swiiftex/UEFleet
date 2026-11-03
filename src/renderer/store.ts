@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react';
-import { MASTER_CHAT_ID, type AgentCard, type FleetSnapshot, type HubEvent, type TranscriptItem } from '../shared/protocol';
+import { DEFAULT_PERMISSION_MODE, MASTER_CHAT_ID, type AgentCard, type FleetSnapshot, type HubEvent, type TranscriptItem } from '../shared/protocol';
 
 declare global {
   interface Window {
@@ -11,6 +11,7 @@ declare global {
       copy: (t: string) => Promise<void>;
       reveal: (p: string) => Promise<void>;
       applyUpdate: () => Promise<void>;
+      setApiKey: (key: string | null) => Promise<string | null>;
     };
   }
 }
@@ -32,7 +33,7 @@ export interface UiState {
   messagesOnly: boolean;
 }
 
-const empty: FleetSnapshot = { cards: [], machines: [], broadcasts: [], pairing: null, testList: [], defaults: { model: 'claude-opus-5-5', effort: 'xhigh', permissionMode: 'acceptEdits', instanceMode: 'offscreen', projectFile: null }, hostAppPath: null, demo: false };
+const empty: FleetSnapshot = { cards: [], machines: [], broadcasts: [], pairing: null, testList: [], defaults: { model: 'claude-opus-5-5', effort: 'xhigh', permissionMode: DEFAULT_PERMISSION_MODE, instanceMode: 'offscreen', projectFile: null }, hostAppPath: null, demo: false };
 
 function savedMessagesOnly() {
   try { return localStorage.getItem('messagesOnly') === '1'; } catch { return false; }
@@ -84,6 +85,7 @@ export function handleEvent(e: HubEvent) {
     case 'tests': setState({ snapshot: { ...s, testList: e.testList } }); break;
     case 'transcript': applyTranscript(e); break;
     case 'all-done': if (e.count > 0) setState({ allDone: { count: e.count, at: Date.now() } }); break;
+    case 'api-credits': setState({ snapshot: { ...s, apiCredits: e.view } }); break;
     // Someone watching the master chat follows the request to the agent it started.
     case 'task-started': if (state.selectedId === MASTER_CHAT_ID) void select(e.id); break;
     case 'app-update':

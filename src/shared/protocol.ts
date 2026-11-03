@@ -85,6 +85,9 @@ export type AgentEvent =
   | { k: 'usage'; usage: Partial<UsageSnapshot> }
   | { k: 'tokens'; n: number }
   | { k: 'progress'; percent: number }
+  | { k: 'usage-limit'; resetsAt?: number }
+  | { k: 'credits-failed'; why: string }
+  | { k: 'workspace-hold'; id: string; on: boolean; summary?: string }
   | { k: 'ask-master'; id: string; question: string }
   | { k: 'attention'; kind: AttentionKind; text: string; ref?: string }
   | { k: 'attention-clear'; ref?: string }
@@ -147,6 +150,7 @@ export interface NodeInfo {
   version: string;
   build?: string; // a hash of the running host, so the master can tell when it's out of date
   selfUpdate?: boolean; // false when it isn't running from its own exe, as in development
+  sharedMergeBase?: boolean; // it can provide a version to merge from for work in a shared folder
 }
 
 export interface NodeStats {
@@ -167,6 +171,8 @@ export interface AgentSpawn {
   resumeSessionId?: string;
   instanceMode: InstanceMode;
   demo?: string;
+  workspace?: boolean;
+  apiKey?: string; // only in the call that starts an agent, and never saved
 }
 
 export interface ProjectRef {
@@ -241,6 +247,11 @@ export interface AgentCard {
   testRun?: TestRun;
   merge?: MergeState;
   changelist?: string;
+  onApiCredits?: boolean; // billed to the API key, because the subscription hit a limit
+  creditsUntil?: number;
+  isWorkspace?: boolean; // the chat that may change the workspace itself, pinned above the rest
+  holdingWorkspace?: boolean;
+  pausedForWorkspace?: boolean;
 }
 
 // Where the one-button test has got to.
@@ -293,6 +304,21 @@ export interface FleetSnapshot {
   hostAppPath: string | null;
   demo: boolean;
   appUpdate?: AppUpdate | null;
+  apiCredits?: ApiCreditsView;
+}
+
+// The key itself never reaches the screens.
+export interface ApiCreditsView {
+  enabled: boolean;
+  hasKey: boolean;
+  problem?: string;
+}
+
+// What can change on an agent that's already running.
+export interface AgentOptions {
+  model?: string;
+  effort?: string;
+  permissionMode?: string;
 }
 
 export interface NewTaskDefaults {
@@ -313,6 +339,7 @@ export interface NewTask {
   permissionMode: string;
   instanceMode: InstanceMode;
   demo?: string;
+  workspace?: boolean;
 }
 
 export type HubEvent =
@@ -324,7 +351,8 @@ export type HubEvent =
   | { e: 'transcript'; agentId: string; items: TranscriptItem[]; deltas: { id: string; text: string }[] }
   | { e: 'all-done'; count: number }
   | { e: 'task-started'; id: string }
-  | { e: 'app-update'; update: AppUpdate | null };
+  | { e: 'app-update'; update: AppUpdate | null }
+  | { e: 'api-credits'; view: ApiCreditsView };
 
 export const MODELS = [
   { id: 'claude-opus-5-5', label: 'Opus 5.5' },
@@ -339,6 +367,11 @@ export const PERMISSION_MODES = [
   { id: 'auto', label: 'Auto (classifier decides)' },
   { id: 'bypassPermissions', label: 'Bypass all prompts' },
 ];
+// What every new agent runs with. A different pick in New Task lasts for that request only.
+export const DEFAULT_PERMISSION_MODE = 'auto';
+// Bypass isn't here on purpose. The master chat reads tickets and documents, and one of those
+// shouldn't be able to talk it into turning off every prompt.
+export const MASTER_PERMISSION_MODES = ['default', 'auto', 'acceptEdits'];
 export const INSTANCE_MODES: { id: InstanceMode; label: string; hint: string }[] = [
   { id: 'offscreen', label: 'Offscreen', hint: 'no window, renders' },
   { id: 'headless', label: 'Headless', hint: 'lightest, no rendering' },

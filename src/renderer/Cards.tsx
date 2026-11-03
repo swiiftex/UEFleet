@@ -101,15 +101,15 @@ export const Card = memo(function Card({ c, selected, now, machine }: { c: Agent
   const slot = c.slot;
   const showTps = c.tps > 0.5;
   return (
-    <button className={`card s-${c.status}${selected ? ' selected' : ''}`} onClick={() => void select(c.id)} data-card={c.id}>
+    <button className={`card s-${c.status}${selected ? ' selected' : ''}${c.isWorkspace ? ' workspace' : ''}`} onClick={() => void select(c.id)} data-card={c.id}>
       <div className="card-head">
         <StatusGlyph c={c} />
         <span className="card-num">{pad2(c.index)}</span>
         <span className="card-title">{c.title}</span>
         <span className="card-status" data-stage={c.stage}>{stageLabel(c)}</span>
       </div>
-      <FlowSteps c={c} />
-      <TaskProgress c={c} />
+      {!c.isWorkspace && <FlowSteps c={c} />}
+      {!c.isWorkspace && <TaskProgress c={c} />}
       <div className="card-msg">
         <span className="card-msg-text">{c.attention?.text && c.status === 'attention' ? c.attention.text : (c.detail && c.status === 'provisioning' ? c.detail : c.lastText || 'Starting…')}</span>
         <span className="card-msg-age">{fmtAgo(c.lastTextAt || c.createdAt, now)}</span>
@@ -118,6 +118,9 @@ export const Card = memo(function Card({ c, selected, now, machine }: { c: Agent
         <span className="dot-model" />
         <span className="card-model">{modelLabel(c.model)} <em>@{c.effort}</em></span>
         <span className="card-tag">{machine?.info.name ?? 'offline'}</span>
+        {c.holdingWorkspace && <span className="card-tag tag-workspace" data-holding>agents paused</span>}
+        {c.pausedForWorkspace && <span className="card-tag tag-workspace">paused</span>}
+        {c.onApiCredits && <span className="card-tag tag-credits" data-on-credits>API credits</span>}
         {slot && <span className={`card-tag slot-${slot.state}`}>{slot.state === 'cold' || slot.state === 'syncing' ? SLOT_LABEL[slot.state] : `UE :${slot.port} ${SLOT_LABEL[slot.state]}`}</span>}
       </div>
       <div className="card-path">{c.project ?? 'no project'}{slot?.progress != null ? ` · copying ${Math.round(slot.progress * 100)}%` : ''}</div>
@@ -147,7 +150,8 @@ export function CardGrid() {
   const now = useStore((s) => s.now);
 
   const tasks = cards.filter((c) => !c.archived && !c.isMaster);
-  const visible = tasks.filter((c) => !filter || `${c.title} ${c.project} ${c.stage} ${c.status} ${c.lastPrompt}`.toLowerCase().includes(filter.toLowerCase()));
+  const pinned = tasks.filter((c) => c.isWorkspace);
+  const visible = tasks.filter((c) => !c.isWorkspace).filter((c) => !filter || `${c.title} ${c.project} ${c.stage} ${c.status} ${c.lastPrompt}`.toLowerCase().includes(filter.toLowerCase()));
   if (!tasks.length) {
     return (
       <div className="empty">
@@ -159,6 +163,14 @@ export function CardGrid() {
   }
   return (
     <div className="grid-scroll">
+      {pinned.length > 0 && (
+        <section data-pinned>
+          <h3 className="group-head workspace-head"><span>◆</span> Workspace chat <span>can merge, switch and update your workspace</span></h3>
+          <div className="card-grid">
+            {pinned.map((c) => <Card key={c.id} c={c} selected={c.id === selectedId} now={now} machine={machines.find((m) => m.info.id === c.nodeId)} />)}
+          </div>
+        </section>
+      )}
       {machines.map((m) => {
         const mine = visible.filter((c) => c.nodeId === m.info.id);
         if (!mine.length) return null;

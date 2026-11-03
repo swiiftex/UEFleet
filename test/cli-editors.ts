@@ -67,6 +67,14 @@ const SCRIPTS: Record<string, Step[]> = {
   'master-route': [{ tool: { name: 'mcp__fleet__start_task', input: { prompt: 'From the master [script:testing]', title: 'Routed by the master' } } }, { text: 'Started it.' }],
   'master-answer': [{ tool: { name: 'mcp__fleet__answer_agent', input: { request_id: '$REQUEST_ID', answer: 'the ticket says blue' } } }, { text: 'Answered.' }],
   asks: [{ tool: { name: 'mcp__fleet__ask_master', input: { question: 'What does NIGH-1 say? [script:master-answer]' } } }, fin('$LAST_RESULT', ['Asked the master']), { text: 'Done.' }],
+  'master-switch': [{ tool: { name: 'mcp__fleet__set_agent_options', input: { agents: ['$AGENT'], model: 'claude-opus-5-5', effort: 'xhigh', permission_mode: 'acceptEdits' } } }, { text: 'Switched.' }],
+  'after-switch': [{ tool: { name: 'Write', input: { file_path: 'switched.txt', content: 'written with no prompt\n' } } }, fin('Wrote it.', ['Checked the file']), { text: 'Done.' }],
+  'master-mode': [{ tool: { name: 'mcp__fleet__set_own_permissions', input: { mode: 'auto' } } }, { text: 'Switched myself.' }],
+  'limit-hit': [fin('Carried on.', ['Checked it']), { text: 'Done.' }],
+  'limit-billing': [{ text: 'Never reached.' }],
+  'master-workspace': [{ tool: { name: 'mcp__fleet__open_workspace_chat', input: { prompt: 'Merge main into dev [script:workspace]' } } }, { text: 'Opened.' }],
+  workspace: [{ tool: { name: 'mcp__fleet__hold_workspace', input: {} } }, { tool: { name: 'mcp__fleet__release_workspace', input: { summary: 'merged main into dev' } } }, { text: 'Merged it.' }],
+  'master-clear': [{ tool: { name: 'mcp__fleet__stop_agents', input: { agents: ['$AGENT'] } } }, { tool: { name: 'mcp__fleet__archive_agents', input: { agents: ['$AGENT'] } } }, { text: 'Cleared.' }],
   reply: [{ text: 'Two possible causes. Which do you want fixed?' }],
   followup: [fin('Followed up: $HAS_HISTORY', ['Remembered the conversation']), { text: 'Done.' }],
   remote: [
@@ -80,7 +88,8 @@ const SCRIPTS: Record<string, Step[]> = {
 
 // ---- The scripted API ----
 
-const seen: { marker: string; messages: any[]; tools: string[] }[] = [];
+const seen: { marker: string; messages: any[]; tools: string[]; model: string; effort?: string; apiKey?: string }[] = [];
+let switchedAgent = 0;
 const systemSeen = new Map<string, unknown>();
 const sysFor = (marker: string) => JSON.stringify(systemSeen.get(marker) ?? '');
 function lastResultText(messages: any[]) {
@@ -117,8 +126,20 @@ const api = http.createServer((req, res) => {
     let step = 0;
     for (const m of messages.slice(from + 1)) if (m.role === 'assistant') step++;
     if (hasTools && marker) {
-      seen.push({ marker, messages, tools: json.tools.map((t: any) => t.name) });
+      seen.push({ marker, messages, tools: json.tools.map((t: any) => t.name), model: json.model, effort: json.output_config?.effort, apiKey: req.headers['x-api-key'] as string | undefined });
       systemSeen.set(marker, json.system);
+    }
+    // The subscription's limit is reached, and what happens next depends on what's signed in.
+    const apiKey = req.headers['x-api-key'];
+    if (hasTools && marker.startsWith('limit-') && !apiKey) {
+      res.writeHead(429, { 'content-type': 'application/json', 'anthropic-ratelimit-unified-status': 'rejected', 'anthropic-ratelimit-unified-reset': String(Math.floor(Date.now() / 1000) + 3600), 'anthropic-ratelimit-unified-representative-claim': 'five_hour', 'anthropic-ratelimit-unified-overage-status': 'rejected', 'anthropic-ratelimit-unified-overage-disabled-reason': 'org_level_disabled' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: "This request would exceed your account's rate limit." } }));
+      return;
+    }
+    if (hasTools && marker === 'limit-billing' && apiKey) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.' } }));
+      return;
     }
     const script = hasTools ? SCRIPTS[marker] : undefined;
     let s: Step = script?.[step] ?? { text: 'ok' };
@@ -126,6 +147,7 @@ const api = http.createServer((req, res) => {
       const history = JSON.stringify(messages);
       s = { tool: { ...s.tool, input: { ...s.tool.input, summary: s.tool.input.summary.replace('$LAST_RESULT', lastResultText(messages)).replace('$HAS_HISTORY', String(history.includes('[script:question]'))) } } };
     }
+    if (s.tool?.input?.agents?.[0] === '$AGENT') s = { tool: { ...s.tool, input: { ...s.tool.input, agents: [switchedAgent] } } };
     if (s.tool?.input?.request_id === '$REQUEST_ID') {
       const asked = [...JSON.stringify(messages).matchAll(/request_id: ([^\\\s"]+)/g)].at(-1)?.[1];
       s = { tool: { ...s.tool, input: { ...s.tool.input, request_id: asked } } };
@@ -343,6 +365,69 @@ try {
   const doneAsk = await waitFor(asker, (c) => c.status === 'finished', 'the agent that asked', 90_000);
   check('an agent gets an answer from the master through the real tools', /the ticket says blue/.test(doneAsk.final?.summary ?? ''), doneAsk.final);
   check('and the master saw who was asking', hub.transcript('master-chat').some((t: Item) => t.kind === 'user' && t.text.startsWith('[Question from agent') && t.text.includes('NIGH-1')));
+
+  // The strictest mode would stop at the Write, so getting past it shows permissions really changed.
+  const sw = await hub.createAgent(task('reply', { model: 'claude-sonnet-5-5', effort: 'low', permissionMode: 'default' }));
+  await waitFor(sw, (c) => c.attention?.kind === 'reply', 'the agent to switch', 90_000);
+  switchedAgent = card(sw).index;
+  await hub.send('master-chat', 'Put it on xhigh [script:master-switch]');
+  await waitFor(sw, (c) => c.effort === 'xhigh', 'the master to switch it', 90_000);
+  await hub.send(sw, 'Carry on [script:after-switch]');
+  const doneSw = await waitFor(sw, (c) => c.status === 'finished' || c.attention?.kind === 'permission', 'it to carry on', 90_000);
+  const switched = seen.filter((s) => s.marker === 'after-switch').at(-1)!;
+  check('the master changes a running agent, and its next call uses the new model', switched?.model === 'claude-opus-5-5', switched?.model);
+  check('and the new effort', switched?.effort === 'xhigh', switched?.effort);
+  check('and the new permissions, with no prompt', doneSw.status === 'finished' && !hub.transcript(sw).some((t: Item) => t.kind === 'permission'), doneSw.attention);
+  check('the master tool said so', tools('master-chat').some((t) => t.name === 'mcp__fleet__set_agent_options' && t.result?.includes('changed')), tools('master-chat').at(-1));
+  await hub.send('master-chat', 'Clear it away [script:master-clear]');
+  for (let i = 0; i < 900 && !(hub as any).agents.get(sw).card.archived; i++) await sleep(100);
+  check('the master stops and archives an agent through the real tools', (hub as any).agents.get(sw).card.archived === true && !(hub as any).local.agents.has(sw), tools('master-chat').slice(-2));
+
+  await hub.send('master-chat', 'Switch to auto [script:master-mode]');
+  for (let i = 0; i < 900 && !hub.transcript('master-chat').some((t: Item) => t.kind === 'assistant' && t.text.includes('Switched myself')); i++) await sleep(100);
+  check('asked to, the master changes its own permissions mid-session, and carries on', card('master-chat').permissionMode === 'auto' && hub.transcript('master-chat').some((t: Item) => t.kind === 'assistant' && t.text.includes('Switched myself')), tools('master-chat').at(-1));
+
+  log('The workspace chat');
+  (hub as any).local.addProject(PROJECT);
+  (hub as any).defaults.projectFile = PROJECT;
+  await hub.send('master-chat', 'Open a workspace chat [script:master-workspace]');
+  let wsCard: any;
+  for (let i = 0; i < 900 && !wsCard; i++) { wsCard = hub.snapshot().cards.find((c: any) => c.isWorkspace && !c.archived); await sleep(100); }
+  check('the master opens a workspace chat through the real tools', !!wsCard && wsCard.project === path.basename(PROJECT, '.uproject'), tools('master-chat').at(-1));
+  const doneWs = await waitFor(wsCard.id, (c) => c.attention?.kind === 'reply' || c.status === 'idle', 'the workspace chat', 120_000);
+  const heldTool = tools(wsCard.id).find((t) => t.name === 'mcp__fleet__hold_workspace');
+  check('it holds the workspace, and hears who else is there', heldTool?.state === 'done' && heldTool.result.includes('personEditorOpen') && heldTool.result.includes('"agents"'), heldTool);
+  check('and lets it go again', tools(wsCard.id).find((t) => t.name === 'mcp__fleet__release_workspace')?.result?.includes('carrying on') && !doneWs.holdingWorkspace, tools(wsCard.id).at(-1));
+  const wsSys = sysFor('workspace');
+  const wsTools = seen.find((s) => s.marker === 'workspace')!.tools;
+  check('it is told it may change the workspace, and the rule against that is gone', wsSys.includes('You are the workspace chat') && !wsSys.includes('Never run anything that reverts'), wsSys.slice(0, 300));
+  check('it has the tools for that, and no finish_task', wsTools.includes('mcp__fleet__hold_workspace') && !wsTools.includes('mcp__fleet__finish_task'), wsTools.filter((t) => t.startsWith('mcp__')));
+  check("normal agents don't", !tl.includes('mcp__fleet__hold_workspace') && sysFor('pie-a').includes('Never run anything that reverts'));
+  await hub.archive(wsCard.id);
+
+  log('API credits');
+  // A made-up subscription token, so the CLI behaves as it does for a subscriber at a limit.
+  delete process.env.ANTHROPIC_API_KEY;
+  process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-fleet-test-subscription';
+  hub.setApiKey('sk-ant-fleet-test');
+  hub.setApiCreditsEnabled(true);
+  const lim = await hub.createAgent(task('limit-hit'));
+  const doneLim = await waitFor(lim, (c) => c.status === 'finished' || c.attention, 'the agent at the limit', 150_000);
+  const limCalls = seen.filter((s) => s.marker === 'limit-hit');
+  check('an agent at the limit carries on with API credits, with no prompt', doneLim.status === 'finished' && doneLim.onApiCredits === true, [doneLim.status, doneLim.onApiCredits, doneLim.attention]);
+  check('having tried the subscription first', limCalls.length >= 2 && !limCalls[0].apiKey, limCalls.map((c) => c.apiKey));
+  check('and billed to the key after that', limCalls.at(-1)?.apiKey === 'sk-ant-fleet-test', limCalls.at(-1)?.apiKey);
+  check('in the same conversation', JSON.stringify(limCalls.at(-1)?.messages).includes('Run the script [script:limit-hit]') && JSON.stringify(limCalls.at(-1)?.messages).includes('carry on from where you stopped'));
+  check('and the chat says so', hub.transcript(lim).some((t: Item) => t.kind === 'system' && t.text.includes('carrying on with API credits until')), hub.transcript(lim).filter((t: Item) => t.kind === 'system'));
+  const bill = await hub.createAgent(task('limit-billing'));
+  const doneBill = await waitFor(bill, (c) => c.attention?.kind === 'error', 'the agent with no credits', 150_000);
+  check('out of credits, it stops and says why, rather than looping', /credit balance/i.test(doneBill.attention?.text ?? '') && !doneBill.onApiCredits, doneBill.attention);
+  check('and the setting shows it', /credit balance/i.test(hub.snapshot().apiCredits?.problem ?? ''), hub.snapshot().apiCredits);
+  hub.setApiKey(null);
+  await hub.stopAgent(lim);
+  await hub.stopAgent(bill);
+  delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  process.env.ANTHROPIC_API_KEY = 'scripted';
 
   log('Follow-ups');
   await hub.send(q, 'Now do this [script:followup]');

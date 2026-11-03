@@ -16,6 +16,7 @@
   --orange: #fb923c;
   --amber: #f5b13d;
   --red: #f87171;
+  --workspace: #f472b6;
   --b-thinking: var(--purple);
   --b-coding: var(--blue);
   --b-tools: var(--teal);
@@ -365,3 +366,16 @@ section h3 { font-size: 11px; font-weight: 600; margin: 8px 0 4px; }
 @media (prefers-reduced-motion: reduce) {
   .card.s-attention, .glyph-ring, .t-running .tool-dot, .popup { animation: none; }
 }
+
+/* The workspace chat: it can change everyone's files, so it stands apart and stays on top. */
+.card.workspace { --accent: var(--workspace); border-color: var(--workspace); border-top-color: var(--workspace); box-shadow: 0 0 0 2px var(--workspace), 0 0 14px rgba(244, 114, 182, .28); }
+/* Blue means selected on every card, so here it goes outside the card's own colour. */
+.card.workspace.selected { box-shadow: 0 0 0 2px var(--workspace), 0 0 0 4px #8cc8ff, 0 0 18px rgba(140, 200, 255, .3); }
+.group-head.workspace-head, .group-head.workspace-head span { color: var(--workspace); }
+.card-tag.tag-workspace { color: var(--workspace); border-color: var(--workspace); }
+.card-tag.tag-credits { color: var(--amber); border-color: var(--amber); }
+.workspace-banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 12px; border-bottom: 1px solid var(--workspace); color: var(--workspace); background: rgba(244, 114, 182, .08); font-size: 11.5px; }
+.workspace-banner .btn { flex: none; }
+.credits-toggle { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
+.credits-key { flex: 1; min-width: 0; background: var(--bg); color: var(--text); padding: 4px 7px; border: 1px solid var(--line-2); font: inherit; font-size: 10.5px; }
+.mode-select { background: var(--panel); color: var(--dim); border: 1px solid var(--line-2); font: inherit; font-size: 10.5px; padding: 0 2px; }

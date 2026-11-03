@@ -77,7 +77,7 @@ export function BroadcastOverlay() {
   useEffect(() => { if (open) ref.current?.focus(); }, [open]);
   useEffect(() => { if (threadRef.current) threadRef.current.scrollTop = threadRef.current.scrollHeight; }, [broadcasts, open]);
 
-  const present = cards.filter((c) => !c.archived && !c.isMaster);
+  const present = cards.filter((c) => !c.archived && !c.isMaster && !c.isWorkspace);
   // Finished agents aren't messaged unless asked for: it would restart them and spend tokens.
   const targets = present.filter((c) => (c.status === 'finished' || c.status === 'stopped' ? includeDone.has(c.id) : !excluded.has(c.id)));
   if (!open) return null;
@@ -185,6 +185,7 @@ export function NewTaskModal() {
   useEffect(() => {
     if (!open) return;
     setProjectFile(getState().snapshot.defaults.projectFile ?? getState().snapshot.machines.find((m) => m.info.id === 'master')?.info.projects[0]?.file ?? null);
+    setPermissionMode(getState().snapshot.defaults.permissionMode);
     ref.current?.focus();
   }, [open]);
   const projects = useMemo(() => master?.info.projects ?? [], [master]);
@@ -287,7 +288,7 @@ export function NewTaskModal() {
             <select value={effort} onChange={(e) => setEffort(e.target.value)}>{EFFORTS.map((x) => <option key={x}>{x}</option>)}</select>
           </label>
           <label>Permissions
-            <select value={permissionMode} onChange={(e) => setPermissionMode(e.target.value)}>{PERMISSION_MODES.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}</select>
+            <select data-permission-mode value={permissionMode} onChange={(e) => setPermissionMode(e.target.value)}>{PERMISSION_MODES.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}</select>
           </label>
           <label>Editor
             <select value={instanceMode} onChange={(e) => setInstanceMode(e.target.value as InstanceMode)} title={INSTANCE_MODES.find((m) => m.id === instanceMode)?.hint}>{INSTANCE_MODES.map((m) => <option key={m.id} value={m.id}>{m.label}: {m.hint}</option>)}</select>
@@ -300,6 +301,33 @@ export function NewTaskModal() {
         </div>
       </div>
     </div>
+  );
+}
+
+function ApiCredits() {
+  const credits = useStore((s) => s.snapshot.apiCredits);
+  const [key, setKey] = useState('');
+  const [problem, setProblem] = useState<string | null>(null);
+  const save = async (value: string | null) => {
+    const refused = await window.fleet.setApiKey(value);
+    setProblem(refused);
+    if (!refused) setKey('');
+  };
+  return (
+    <section data-api-credits>
+      <h3>API credits</h3>
+      <label className="credits-toggle">
+        <input type="checkbox" data-api-credits-on checked={!!credits?.enabled} disabled={!credits?.hasKey} onChange={(e) => void window.fleet.call('setApiCreditsEnabled', e.target.checked)} />
+        Use API credits if available
+      </label>
+      <p className="pair-note">Agents use your subscription first. If one hits a usage limit, it carries on billed to this key until the limit resets, then goes back. That spends real money from the Console organisation that owns the key. Make a key at console.anthropic.com.</p>
+      <div className="pair-code">
+        <input type="password" className="credits-key" data-api-key autoComplete="off" spellCheck={false} placeholder={credits?.hasKey ? 'A key is saved. Paste another to replace it.' : 'Paste an API key'} value={key} onChange={(e) => setKey(e.target.value)} />
+        <button className="btn" data-api-key-save disabled={!key.trim()} onClick={() => void save(key.trim())}>Save key</button>
+        {credits?.hasKey && <button className="btn" data-api-key-remove onClick={() => void save(null)}>Remove key</button>}
+      </div>
+      {(problem ?? credits?.problem) && <p className="final-warn" data-api-credits-problem>{problem ?? credits?.problem}</p>}
+    </section>
   );
 }
 
@@ -335,6 +363,7 @@ export function MachinesModal() {
             </>
           ) : <p className="final-warn">The link server isn't running.</p>}
         </section>
+        <ApiCredits />
         <section>
           <h3>Linked</h3>
           <ul className="machine-list">
